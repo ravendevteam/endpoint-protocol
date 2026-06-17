@@ -179,12 +179,16 @@ def create_app(config: ServerConfig) -> FastAPI:
 				if not isinstance(message_id, str):
 					continue
 				if frame_type == "ack":
-					if state.queue.ack(client_ref, message_id):
+					accepted = state.queue.ack(client_ref, message_id)
+					if accepted:
 						state.log.write("message_acked", client_ref=client_ref, message_id=message_id)
+					await _send_wss_result(websocket, "ack_result", message_id, accepted)
 				elif frame_type == "reject":
 					reason = _safe_reject_reason(frame.get("reason"))
-					if state.queue.reject(client_ref, message_id, reason):
+					accepted = state.queue.reject(client_ref, message_id, reason)
+					if accepted:
 						state.log.write("message_rejected", client_ref=client_ref, message_id=message_id, reason=reason)
+					await _send_wss_result(websocket, "reject_result", message_id, accepted)
 		except WebSocketDisconnect:
 			state.log.write("wss_disconnected", client_ref=client_ref)
 
@@ -212,6 +216,14 @@ async def _receive_wss_frame(websocket: WebSocket) -> dict[str, Any] | None:
 	if not isinstance(frame, dict):
 		return None
 	return frame
+
+
+async def _send_wss_result(websocket: WebSocket, frame_type: str, message_id: str, accepted: bool) -> None:
+	await websocket.send_json({
+		"type": frame_type,
+		"message_id": message_id,
+		"status": "ok" if accepted else "not_found",
+	})
 
 
 def _safe_reject_reason(reason: Any) -> str:

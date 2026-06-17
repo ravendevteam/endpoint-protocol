@@ -562,7 +562,8 @@ async def test_lease_expiry_redelivery_and_reject_drop_for_poison_message(tmp_pa
 		async with connect(f"wss://127.0.0.1:{port_b}/v1/client/bob/inbox", ssl=ssl_context, additional_headers={"Authorization": "Bearer bob-token"}) as websocket:
 			second_frame = parse_json_strict(await asyncio.wait_for(websocket.recv(), timeout=5))
 			await websocket.send(json.dumps({"type": "ack", "message_id": second_frame["envelope"]["message_id"]}))
-			await asyncio.sleep(0.3)
+			ack_result = parse_json_strict(await asyncio.wait_for(websocket.recv(), timeout=5))
+			assert ack_result == {"type": "ack_result", "message_id": second_frame["envelope"]["message_id"], "status": "ok"}
 			trace(f"Bob received the same message again and acked {second_frame['envelope']['message_id']}")
 		assert first_frame["envelope"]["message_id"] == second_frame["envelope"]["message_id"]
 		assert app_b.state.endpoint.queue.count_active("bob") == 0
@@ -1332,7 +1333,8 @@ async def test_reject_reason_is_sanitized_before_quarantine_and_logs_do_not_leak
 			frame = parse_json_strict(await asyncio.wait_for(websocket.recv(), timeout=5))
 			assert frame["envelope"]["message_id"] == envelope["message_id"]
 			await websocket.send(json.dumps({"type": "reject", "message_id": envelope["message_id"], "reason": "secret details " + ("x" * 500)}))
-			await asyncio.sleep(0.3)
+			reject_result = parse_json_strict(await asyncio.wait_for(websocket.recv(), timeout=5))
+			assert reject_result == {"type": "reject_result", "message_id": envelope["message_id"], "status": "ok"}
 		rejected = app_b.state.endpoint.queue.read_rejected("bob", envelope["message_id"])
 		assert rejected is not None
 		assert rejected["reject_reason"] == "invalid_envelope"

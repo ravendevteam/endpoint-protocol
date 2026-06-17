@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -212,31 +213,58 @@ class EndpointClient:
 		uri = self._wss_inbox_uri()
 		ssl_context = self._ssl_context()
 		messages: list[ReceivedMessage] = []
+		deferred_frames: deque[dict[str, Any]] = deque()
 		deadline = asyncio.get_running_loop().time() + timeout
 		async with connect(uri, ssl=ssl_context, additional_headers=self._auth_headers()) as websocket:
 			while len(messages) < limit and asyncio.get_running_loop().time() < deadline:
-				remaining = max(0.1, deadline - asyncio.get_running_loop().time())
 				try:
-					frame_text = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+					frame = deferred_frames.popleft() if deferred_frames else await self._receive_wss_json(websocket, deadline)
 				except asyncio.TimeoutError:
 					break
-				frame = parse_json_strict(frame_text)
 				if frame.get("type") != "message":
 					continue
 				envelope = frame.get("envelope")
 				message_id = envelope.get("message_id") if isinstance(envelope, dict) else None
 				try:
-					message = self.process_envelope(envelope)
+					message = self.process_envelope(envelope, mark_processed=False)
 				except EndpointError as exc:
 					reason = exc.code if exc.code in {"malformed_ciphertext", "wrong_recipient", "signature_invalid", "outer_inner_mismatch"} else "invalid_envelope"
 					if isinstance(message_id, str):
 						await websocket.send(json.dumps({"type": "reject", "message_id": message_id, "reason": reason}))
+						await self._wait_for_wss_result(websocket, "reject_result", message_id, deadline, deferred_frames)
 					continue
 				await websocket.send(json.dumps({"type": "ack", "message_id": message.message_id}))
-				messages.append(message)
+				if await self._wait_for_wss_result(websocket, "ack_result", message.message_id, deadline, deferred_frames):
+					self.state.mark_processed(message.message_id)
+					messages.append(message)
 		return messages
 
-	def process_envelope(self, envelope: Any) -> ReceivedMessage:
+	async def _receive_wss_json(self, websocket: Any, deadline: float) -> dict[str, Any]:
+		remaining = deadline - asyncio.get_running_loop().time()
+		if remaining <= 0:
+			raise asyncio.TimeoutError
+		frame_text = await asyncio.wait_for(websocket.recv(), timeout=max(0.1, remaining))
+		return parse_json_strict(frame_text)
+
+	async def _wait_for_wss_result(
+		self,
+		websocket: Any,
+		expected_type: str,
+		message_id: str,
+		deadline: float,
+		deferred_frames: deque[dict[str, Any]],
+	) -> bool:
+		while asyncio.get_running_loop().time() < deadline:
+			try:
+				frame = await self._receive_wss_json(websocket, deadline)
+			except asyncio.TimeoutError:
+				return False
+			if frame.get("type") == expected_type and frame.get("message_id") == message_id:
+				return frame.get("status") == "ok"
+			deferred_frames.append(frame)
+		return False
+
+	def process_envelope(self, envelope: Any, mark_processed: bool = True) -> ReceivedMessage:
 		validate_encrypted_envelope(envelope)
 		if self.state.has_processed(envelope["message_id"]):
 			raise EndpointError("duplicate_message_id", "message was already processed")
@@ -270,7 +298,8 @@ class EndpointClient:
 			"identity_signature": "",
 		}
 		self.state.remember_identity(sender_identity)
-		self.state.mark_processed(envelope["message_id"])
+		if mark_processed:
+			self.state.mark_processed(envelope["message_id"])
 		return ReceivedMessage(
 			message_id=envelope["message_id"],
 			body=payload["body"],
