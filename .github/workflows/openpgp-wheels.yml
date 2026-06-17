@@ -1,0 +1,147 @@
+name: OpenPGP Wheel CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-sequoia-wheels:
+    name: Build Sequoia wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x64
+            artifact: endpoint-openpgp-sequoia-windows-x86_64
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64
+            artifact: endpoint-openpgp-sequoia-linux-x86_64
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64
+            artifact: endpoint-openpgp-sequoia-linux-aarch64
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64
+            artifact: endpoint-openpgp-sequoia-macos-x86_64
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64
+            artifact: endpoint-openpgp-sequoia-macos-aarch64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --manifest-path openpgp-sequoia/Cargo.toml --release --out dist
+          target: ${{ matrix.target }}
+          manylinux: auto
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  e2e-from-built-wheel:
+    name: E2E from wheel (${{ matrix.name }})
+    needs: build-sequoia-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            artifact: endpoint-openpgp-sequoia-windows-x86_64
+          - name: linux-x86_64
+            os: ubuntu-latest
+            artifact: endpoint-openpgp-sequoia-linux-x86_64
+          - name: macos-x86_64
+            os: macos-15-intel
+            artifact: endpoint-openpgp-sequoia-macos-x86_64
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            artifact: endpoint-openpgp-sequoia-linux-aarch64
+          - name: macos-aarch64
+            os: macos-latest
+            artifact: endpoint-openpgp-sequoia-macos-aarch64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download built wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Install Endpoint Protocol from built wheel
+        shell: python
+        run: |
+          import pathlib
+          import subprocess
+          import sys
+
+          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+          	raise SystemExit(f"expected exactly one wheel, found {len(wheels)}")
+
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
+          subprocess.check_call([sys.executable, "-m", "pip", "install", str(wheels[0])])
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps"])
+          subprocess.check_call([
+          	sys.executable,
+          	"-m",
+          	"pip",
+          	"install",
+          	"fastapi>=0.115.0,<0.116",
+          	"httpx",
+          	"uvicorn",
+          	"websockets",
+          	"wsproto<1.3",
+          	"pytest",
+          	"pytest-asyncio",
+          	"trustme",
+          ])
+
+      - name: Ensure crypto has no external process/runtime path
+        shell: python
+        run: |
+          from pathlib import Path
+
+          source = Path("endpoint/crypto.py").read_text(encoding="utf-8")
+          forbidden = ["subprocess", "ctypes", "libgpgme", "Gpg4win", "GnuPG"]
+          found = [item for item in forbidden if item in source]
+          if found:
+          	raise SystemExit(f"forbidden crypto marker(s): {', '.join(found)}")
+
+      - name: Run E2E suite
+        run: python -m pytest -q --endpoint-trace

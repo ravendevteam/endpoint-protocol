@@ -1,0 +1,5 @@
+dist/
+openpgp-sequoia/target/
+__pycache__/
+.pytest_cache/
+*.egg-info/

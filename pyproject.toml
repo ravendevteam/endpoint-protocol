@@ -1,0 +1,23 @@
+[project]
+name = "endpoint-protocol"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+	"fastapi>=0.115.0,<0.116",
+	"httpx",
+	"uvicorn",
+	"websockets",
+	"wsproto<1.3",
+	"endpoint-openpgp-sequoia>=0.1,<0.2",
+]
+
+[project.optional-dependencies]
+test = [
+	"pytest",
+	"pytest-asyncio",
+	"trustme",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
