@@ -42,6 +42,16 @@ class OpenPgpContext:
 		require(raw_fingerprint == key_fingerprint, "crypto_failed", "requested key is not available")
 		return public_key
 
+	def current_fingerprint(self) -> str:
+		if not self._raw_fingerprint_path().exists() or not self._public_key_path().exists() or not self._secret_key_path().exists():
+			raise EndpointError("crypto_failed", "key store is not initialized")
+		raw_fingerprint = self._read_raw_fingerprint()
+		public_key = self._read_public_key()
+		raw_public_fingerprint = raw_openpgp_fingerprint(public_key)
+		require(raw_public_fingerprint == raw_fingerprint, "crypto_failed", "key store fingerprint does not match public key")
+		self._read_secret_key()
+		return raw_fingerprint
+
 	def import_public_key(self, public_key_armored: str) -> None:
 		raw_openpgp_fingerprint(public_key_armored)
 

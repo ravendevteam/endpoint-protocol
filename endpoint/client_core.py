@@ -77,6 +77,12 @@ class EndpointClient:
 			self.key_fingerprint = self.openpgp.generate_identity(name, email)
 		return self.key_fingerprint
 
+	def require_existing_identity(self) -> str:
+		fingerprint = self.key_fingerprint or self.openpgp.current_fingerprint()
+		self.openpgp.export_public_key(fingerprint)
+		self.key_fingerprint = fingerprint
+		return fingerprint
+
 	def public_key_armored(self) -> str:
 		return self.openpgp.export_public_key(self.ensure_identity())
 

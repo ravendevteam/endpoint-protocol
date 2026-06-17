@@ -11,6 +11,9 @@ dependencies = [
 	"endpoint-openpgp-sequoia>=0.1,<0.2",
 ]
 
+[project.scripts]
+endpoint = "endpoint.cli:main"
+
 [project.optional-dependencies]
 test = [
 	"pytest",
