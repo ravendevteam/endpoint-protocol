@@ -36,6 +36,9 @@ class OpenPgpContext:
 		self._raw_fingerprint_path().write_text(raw_fingerprint, encoding="ascii")
 		return raw_fingerprint
 
+	def has_identity_material(self) -> bool:
+		return self._raw_fingerprint_path().exists() or self._public_key_path().exists() or self._secret_key_path().exists()
+
 	def export_public_key(self, key_fingerprint: str) -> str:
 		public_key = self._read_public_key()
 		raw_fingerprint = raw_openpgp_fingerprint(public_key)
@@ -43,8 +46,11 @@ class OpenPgpContext:
 		return public_key
 
 	def current_fingerprint(self) -> str:
-		if not self._raw_fingerprint_path().exists() or not self._public_key_path().exists() or not self._secret_key_path().exists():
+		paths = (self._raw_fingerprint_path(), self._public_key_path(), self._secret_key_path())
+		if not any(path.exists() for path in paths):
 			raise EndpointError("crypto_failed", "key store is not initialized")
+		if not all(path.exists() for path in paths):
+			raise EndpointError("crypto_failed", "key store is incomplete")
 		raw_fingerprint = self._read_raw_fingerprint()
 		public_key = self._read_public_key()
 		raw_public_fingerprint = raw_openpgp_fingerprint(public_key)

@@ -74,7 +74,10 @@ class EndpointClient:
 
 	def ensure_identity(self, name: str | None = None, email: str | None = None) -> str:
 		if self.key_fingerprint is None:
-			self.key_fingerprint = self.openpgp.generate_identity(name, email)
+			if self.openpgp.has_identity_material():
+				self.key_fingerprint = self.openpgp.current_fingerprint()
+			else:
+				self.key_fingerprint = self.openpgp.generate_identity(name, email)
 		return self.key_fingerprint
 
 	def require_existing_identity(self) -> str:

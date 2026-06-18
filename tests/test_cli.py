@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +141,89 @@ def test_identity_export_and_server_config_commands(tmp_path: Path, capsys: pyte
 	assert parse_json_strict(capsys.readouterr().out) == {"config": str(config_path), "status": "ok"}
 
 
+def test_identity_export_reuses_existing_key_store(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+	token = generate_client_token()
+	identity_path = tmp_path / "alice.identity.json"
+	args = [
+		"identity",
+		"export",
+		"client_ref=alice",
+		"home_server_url=https://example.com",
+		f"auth_token={token}",
+		f"state_dir={tmp_path / 'state'}",
+		f"key_store_dir={tmp_path / 'keys'}",
+		"name=Alice",
+		"email=alice@example.test",
+		f"out={identity_path}",
+	]
+	assert cli.main(args) == 0
+	first = parse_json_strict(capsys.readouterr().out)
+	assert cli.main(args) == 0
+	second = parse_json_strict(capsys.readouterr().out)
+	assert second["endpoint_fingerprint"] == first["endpoint_fingerprint"]
+	assert parse_json_strict(identity_path.read_text(encoding="utf-8"))["endpoint_fingerprint"] == first["endpoint_fingerprint"]
+
+
+def test_setup_bundles_do_not_include_private_keys_and_profiles_resolve_paths(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+	host = tmp_path / "host"
+	guest = tmp_path / "guest"
+	invite = tmp_path / "bob.endpoint-invite.zip"
+	enrollment = tmp_path / "bob.endpoint-enrollment.zip"
+	port = free_port()
+	url = f"https://127.0.0.1:{port}"
+	assert cli.main([
+		"setup",
+		"host-init",
+		f"workspace={host}",
+		f"server_url={url}",
+		"bind_host=127.0.0.1",
+		f"port={port}",
+		"owner_ref=alice",
+		"owner_name=Alice",
+	]) == 0
+	capsys.readouterr()
+	assert cli.main(["setup", "invite", f"workspace={host}", "client_ref=bob", f"out={invite}"]) == 0
+	capsys.readouterr()
+	assert_zip_has_no_private_key(invite)
+	assert cli.main(["setup", "join", f"invite={invite}", f"workspace={guest}", "name=Bob", f"out={enrollment}"]) == 0
+	join_output = parse_json_strict(capsys.readouterr().out)
+	assert join_output["profile"] == str(guest / "profile.json")
+	assert_zip_has_no_private_key(enrollment)
+	profile = cli._load_client_profile(guest / "profile.json")
+	assert Path(profile["ca_bundle"]) == guest / "ca.pem"
+	assert Path(profile["key_store_dir"]) == guest / "keys"
+	assert Path(profile["state_dir"]) == guest / "state"
+	assert cli.main(["setup", "enroll", f"workspace={host}", f"enrollment={enrollment}"]) == 0
+	enroll_output = parse_json_strict(capsys.readouterr().out)
+	assert enroll_output["client_ref"] == "bob"
+	config = load_server_config(host / "server.json")
+	assert set(config.hosted_identities) == {"alice", "bob"}
+	assert set(config.client_token_hashes) == {"alice", "bob"}
+
+
+def test_doctor_reports_common_profile_failures(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+	profile_path = tmp_path / "profile.json"
+	cli._write_json_file(profile_path, {
+		"protocol_version": "endpoint-poc-1",
+		"kind": "endpoint-client-profile",
+		"client_ref": "bob",
+		"home_server_url": "https://127.0.0.1:8443",
+		"auth_token": generate_client_token(),
+		"state_dir": "state",
+		"key_store_dir": "keys",
+		"ca_bundle": "missing-ca.pem",
+		"identity_path": "identity.json",
+		"contacts_dir": "contacts",
+		"metadata": {"username": "bob"},
+	})
+	assert cli.main(["doctor", f"profile={profile_path}"]) == 1
+	report = parse_json_strict(capsys.readouterr().out)
+	assert report["status"] == "failed"
+	checks = {check["name"]: check for check in report["checks"]}
+	assert checks["ca_bundle_readable"]["ok"] is False
+	assert checks["key_store_initialized"]["ok"] is False
+
+
 def test_cli_driven_same_server_exchange_drains_queue_without_plaintext(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
 	cert_path, key_path, ca_path = make_tls(tmp_path)
 	port = free_port()
@@ -231,6 +315,54 @@ def test_cli_driven_same_server_exchange_drains_queue_without_plaintext(tmp_path
 	assert_plaintext_absent(server_state, body)
 
 
+def test_setup_profile_driven_same_server_exchange_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+	host = tmp_path / "host"
+	guest = tmp_path / "guest"
+	invite = tmp_path / "bob.endpoint-invite.zip"
+	enrollment = tmp_path / "bob.endpoint-enrollment.zip"
+	port = free_port()
+	url = f"https://127.0.0.1:{port}"
+	assert cli.main([
+		"setup",
+		"host-init",
+		f"workspace={host}",
+		f"server_url={url}",
+		"bind_host=127.0.0.1",
+		f"port={port}",
+		"owner_ref=alice",
+		"owner_name=Alice",
+	]) == 0
+	capsys.readouterr()
+	assert cli.main(["setup", "invite", f"workspace={host}", "client_ref=bob", f"out={invite}"]) == 0
+	capsys.readouterr()
+	assert cli.main(["setup", "join", f"invite={invite}", f"workspace={guest}", "name=Bob", f"out={enrollment}"]) == 0
+	capsys.readouterr()
+	assert cli.main(["setup", "enroll", f"workspace={host}", f"enrollment={enrollment}"]) == 0
+	capsys.readouterr()
+	app = create_app(load_server_config(host / "server.json"))
+	body_ab = "profile-driven hello bob"
+	body_ba = "profile-driven hello alice"
+	with RunningServer(app, port, host / "tls" / "server.pem", host / "tls" / "server.key", host / "tls" / "ca.pem"):
+		assert cli.main(["send", f"profile={host / 'clients' / 'alice' / 'profile.json'}", "to=bob", f"body={body_ab}"]) == 0
+		send_ab = parse_json_strict(capsys.readouterr().out)
+		assert isinstance(send_ab["message_id"], str)
+		assert app.state.endpoint.queue.count_active("bob") == 1
+		assert cli.main(["receive", f"profile={guest / 'profile.json'}", "limit=1", "timeout=5"]) == 0
+		receive_b = parse_json_strict(capsys.readouterr().out)
+		assert [message["body"] for message in receive_b["messages"]] == [body_ab]
+		assert app.state.endpoint.queue.count_active("bob") == 0
+		assert cli.main(["send", f"profile={guest / 'profile.json'}", "to=alice", f"body={body_ba}"]) == 0
+		send_ba = parse_json_strict(capsys.readouterr().out)
+		assert isinstance(send_ba["message_id"], str)
+		assert app.state.endpoint.queue.count_active("alice") == 1
+		assert cli.main(["receive", f"profile={host / 'clients' / 'alice' / 'profile.json'}", "limit=1", "timeout=5"]) == 0
+		receive_a = parse_json_strict(capsys.readouterr().out)
+		assert [message["body"] for message in receive_a["messages"]] == [body_ba]
+		assert app.state.endpoint.queue.count_active("alice") == 0
+	assert_plaintext_absent(host / "server-state", body_ab)
+	assert_plaintext_absent(host / "server-state", body_ba)
+
+
 def free_port() -> int:
 	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
 		sock.bind(("127.0.0.1", 0))
@@ -289,3 +421,13 @@ def assert_plaintext_absent(server_root: Path, plaintext: str) -> None:
 	for path in server_root.rglob("*"):
 		if path.is_file():
 			assert needle not in path.read_bytes(), path
+
+
+def assert_zip_has_no_private_key(path: Path) -> None:
+	with zipfile.ZipFile(path) as archive:
+		for name in archive.namelist():
+			assert "server.key" not in name
+			assert "secret_key" not in name
+			assert "private" not in name.lower()
+			data = archive.read(name)
+			assert b"PRIVATE KEY BLOCK" not in data
