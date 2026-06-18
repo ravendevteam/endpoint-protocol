@@ -29,6 +29,8 @@ from .protocol import (
 from .storage import ClientState
 from .transport import httpx_verify_config, wss_ssl_context
 
+IDENTITY_SIGNATURE_HINT = "Sync system clocks, regenerate the identity or enrollment bundle, and retry."
+
 
 @dataclass
 class DiscoveryResult:
@@ -134,7 +136,7 @@ class EndpointClient:
 		try:
 			verify_detached(identity["public_key_armored"], payload, identity["identity_signature"])
 		except EndpointError as exc:
-			raise EndpointError("invalid_identity_signature", "identity signature does not verify", detail=exc.detail) from exc
+			raise EndpointError("invalid_identity_signature", "identity signature does not verify", detail=exc.detail, hint=IDENTITY_SIGNATURE_HINT) from exc
 
 	async def send_message(
 		self,

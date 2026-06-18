@@ -154,15 +154,16 @@ def _map_backend_error(exc: Exception, code: str, message: str) -> EndpointError
 	if isinstance(exc, EndpointError):
 		return exc
 	backend_name = exc.__class__.__name__
+	detail = f"{backend_name}: {str(exc)}" if str(exc) else backend_name
 	if backend_name == "SignatureInvalid":
-		return EndpointError("signature_invalid", "signature verification failed", detail=backend_name)
+		return EndpointError("signature_invalid", "signature verification failed", detail=detail)
 	if backend_name == "MalformedCiphertext":
-		return EndpointError("malformed_ciphertext", "ciphertext could not be decrypted", detail=backend_name)
+		return EndpointError("malformed_ciphertext", "ciphertext could not be decrypted", detail=detail)
 	if backend_name == "CryptoFailed":
-		return EndpointError(code, message, detail=backend_name)
+		return EndpointError(code, message, detail=detail)
 	if backend_name in {"ModuleNotFoundError", "ImportError"}:
-		return EndpointError("crypto_unavailable", "Sequoia OpenPGP backend is unavailable", detail=backend_name)
-	return EndpointError(code, message, detail=backend_name)
+		return EndpointError("crypto_unavailable", "Sequoia OpenPGP backend is unavailable", detail=detail)
+	return EndpointError(code, message, detail=detail)
 
 
 def _require_backend_string(value: dict[str, Any], key: str) -> str:

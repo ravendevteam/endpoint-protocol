@@ -16,6 +16,7 @@ from .protocol import (
 	ProtocolLimits,
 	canonical_json_bytes,
 	identity_signature_payload,
+	now_iso,
 	validate_encrypted_envelope,
 	validate_identity_envelope,
 )
@@ -101,7 +102,7 @@ def create_app(config: ServerConfig) -> FastAPI:
 
 	@app.get("/v1/health")
 	async def health() -> dict[str, str]:
-		return {"status": "ok"}
+		return {"server_time_utc": now_iso(), "status": "ok"}
 
 	@app.post("/v1/client/discover")
 	async def client_discover(request: Request) -> Any:

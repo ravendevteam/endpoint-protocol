@@ -7,6 +7,7 @@ import shutil
 import ssl
 import sys
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -23,6 +24,7 @@ from .protocol import (
 	PROTOCOL_VERSION,
 	canonical_json_bytes,
 	identity_signature_payload,
+	now_iso,
 	parse_json_strict,
 	validate_identity_envelope,
 	validate_metadata,
@@ -33,6 +35,10 @@ from .transport import httpx_verify_config, normalize_server_url
 
 class CliUsageError(Exception):
 	pass
+
+
+IDENTITY_SIGNATURE_HINT = "Sync system clocks, regenerate the identity or enrollment bundle, and retry."
+CLOCK_SKEW_LIMIT_SECONDS = 30
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -304,6 +310,7 @@ def _cmd_setup_invite(tokens: list[str]) -> int:
 	invite = {
 		"protocol_version": PROTOCOL_VERSION,
 		"kind": "endpoint-demo-invite",
+		"created_at_utc": now_iso(),
 		"server_url": workspace_doc["server_url"],
 		"client_ref": client_ref,
 		"auth_token": token,
@@ -363,12 +370,14 @@ def _cmd_setup_join(tokens: list[str]) -> int:
 	enrollment = {
 		"protocol_version": PROTOCOL_VERSION,
 		"kind": "endpoint-demo-enrollment",
+		"created_at_utc": now_iso(),
 		"server_url": server_url,
 		"client_ref": client_ref,
 		"identity_file": "identity.json",
 	}
 	out_path = Path(values["out"])
 	_write_enrollment_zip(out_path, enrollment, identity)
+	_check_enrollment_bundle(out_path)
 	_write_json({
 		"status": "ok",
 		"client_ref": client_ref,
@@ -382,11 +391,10 @@ def _cmd_setup_enroll(tokens: list[str]) -> int:
 	values = _parse_key_values(tokens, scalar_keys={"workspace", "enrollment"}, required_scalars={"workspace", "enrollment"})
 	workspace = Path(values["workspace"])
 	workspace_doc = _load_workspace(workspace)
-	enrollment, identity = _read_enrollment_zip(Path(values["enrollment"]))
+	enrollment, identity = _check_enrollment_bundle(Path(values["enrollment"]))
 	client_ref = _validate_client_ref(enrollment["client_ref"])
-	require(identity["client_ref"] == client_ref, "invalid_config", "enrollment identity client_ref mismatch")
-	_verify_identity_signature(identity)
 	pending_path = workspace / workspace_doc["pending_invites_dir"] / f"{_safe_file_stem(client_ref)}.json"
+	require(pending_path.exists(), "invalid_config", "pending invite was not found for this enrollment")
 	pending = _load_json_object(str(pending_path), "pending invite")
 	require(pending.get("client_ref") == client_ref, "invalid_config", "pending invite client_ref mismatch")
 	token_hash = pending.get("client_token_hash")
@@ -530,8 +538,14 @@ def _cmd_doctor(tokens: list[str]) -> int:
 		values = _parse_key_values(tokens[1:], scalar_keys={"workspace"}, required_scalars={"workspace"})
 		report = _doctor_server(Path(values["workspace"]))
 	else:
-		values = _parse_key_values(tokens, scalar_keys={"profile"}, required_scalars={"profile"})
-		report = _doctor_profile(Path(values["profile"]))
+		values = _parse_key_values(tokens, scalar_keys={"profile", "enrollment"})
+		targets = [key for key in ("profile", "enrollment") if key in values]
+		if len(targets) != 1:
+			raise CliUsageError("doctor requires exactly one of profile=<path> or enrollment=<path>")
+		if "profile" in values:
+			report = _doctor_profile(Path(values["profile"]))
+		else:
+			report = _doctor_enrollment(Path(values["enrollment"]))
 	_write_json(report)
 	return 0 if report["status"] == "ok" else 1
 
@@ -941,17 +955,24 @@ def _write_enrollment_zip(path: Path, enrollment: dict[str, Any], identity: dict
 
 
 def _read_enrollment_zip(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+	require(path.exists(), "invalid_config", "enrollment file could not be read")
 	try:
 		with zipfile.ZipFile(path) as archive:
 			enrollment = parse_json_strict(archive.read("enrollment.json"))
 			identity = parse_json_strict(archive.read("identity.json"))
 	except EndpointError:
 		raise
+	except KeyError as exc:
+		raise EndpointError("invalid_config", "enrollment zip is missing required files", detail=str(exc)) from exc
+	except zipfile.BadZipFile as exc:
+		raise EndpointError("invalid_config", "enrollment zip is invalid", detail=type(exc).__name__) from exc
 	except Exception as exc:
-		raise EndpointError("invalid_config", "enrollment could not be read", detail=type(exc).__name__) from exc
+		raise EndpointError("invalid_config", "enrollment zip could not be read", detail=type(exc).__name__) from exc
 	require(isinstance(enrollment, dict), "invalid_config", "enrollment must be a JSON object")
 	require(enrollment.get("protocol_version") == PROTOCOL_VERSION, "invalid_config", "enrollment protocol version is unsupported")
 	require(enrollment.get("kind") == "endpoint-demo-enrollment", "invalid_config", "enrollment kind is invalid")
+	if "created_at_utc" in enrollment:
+		_parse_utc_iso(str(enrollment["created_at_utc"]), "enrollment created_at_utc")
 	validate_identity_envelope(identity)
 	return enrollment, identity
 
@@ -964,7 +985,14 @@ def _verify_identity_signature(identity: dict[str, Any]) -> None:
 	try:
 		verify_detached(identity["public_key_armored"], payload, identity["identity_signature"])
 	except EndpointError as exc:
-		raise EndpointError("invalid_identity_signature", "identity signature does not verify", detail=exc.detail) from exc
+		raise EndpointError("invalid_identity_signature", "identity signature does not verify", detail=exc.detail, hint=IDENTITY_SIGNATURE_HINT) from exc
+
+
+def _check_enrollment_bundle(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+	enrollment, identity = _read_enrollment_zip(path)
+	require(identity["client_ref"] == enrollment["client_ref"], "invalid_config", "enrollment identity client_ref mismatch")
+	_verify_identity_signature(identity)
+	return enrollment, identity
 
 
 def _doctor_profile(profile_path: Path) -> dict[str, Any]:
@@ -996,15 +1024,64 @@ def _doctor_profile(profile_path: Path) -> dict[str, Any]:
 			_add_check(checks, "identity_matches_key_store", False, _safe_exception_message(exc))
 		try:
 			response = httpx.get(f"{profile['home_server_url']}/v1/health", verify=httpx_verify_config(_verify_tls_from_values(profile)), timeout=2.0, follow_redirects=False)
-			_add_check(checks, "server_reachable", response.status_code == 200, f"status={response.status_code}")
 		except Exception as exc:
 			_add_check(checks, "server_reachable", False, _safe_exception_message(exc))
+		else:
+			_add_check(checks, "server_reachable", response.status_code == 200, f"status={response.status_code}")
+			if response.status_code == 200:
+				try:
+					health = parse_json_strict(response.text)
+					require(isinstance(health, dict), "invalid_envelope", "health response must be an object")
+					server_time = health.get("server_time_utc")
+					require(isinstance(server_time, str) and server_time != "", "invalid_envelope", "health response is missing server_time_utc")
+					_add_clock_skew_check(checks, _parse_utc_iso(server_time, "server_time_utc"), "server")
+				except Exception as exc:
+					_add_check(checks, "clock_skew_seconds", False, _safe_exception_message(exc))
 		if client is not None:
 			try:
 				result = asyncio.run(client.discover(profile["home_server_url"], profile["client_ref"]))
 				_add_check(checks, "token_auth_and_hosted_identity", result.identity["endpoint_fingerprint"] == _load_json_object(profile["identity_path"], "profile identity")["endpoint_fingerprint"], result.identity["endpoint_fingerprint"])
 			except Exception as exc:
 				_add_check(checks, "token_auth_and_hosted_identity", False, _safe_exception_message(exc))
+	return _doctor_report(checks)
+
+
+def _doctor_enrollment(path: Path) -> dict[str, Any]:
+	checks: list[dict[str, Any]] = []
+	try:
+		enrollment, identity = _read_enrollment_zip(path)
+		_add_check(checks, "enrollment_readable", True, str(path))
+	except Exception as exc:
+		_add_check(checks, "enrollment_readable", False, _safe_exception_message(exc))
+		return _doctor_report(checks)
+	client_ref = enrollment.get("client_ref")
+	fingerprint = identity.get("endpoint_fingerprint")
+	_add_check(
+		checks,
+		"enrollment_identity",
+		identity.get("client_ref") == client_ref,
+		str(client_ref),
+		client_ref=client_ref,
+		endpoint_fingerprint=fingerprint,
+	)
+	created_at = enrollment.get("created_at_utc")
+	created_skew: int | None = None
+	if isinstance(created_at, str) and created_at:
+		try:
+			created_time = _parse_utc_iso(created_at, "created_at_utc")
+			created_skew = _add_clock_skew_check(checks, created_time, "enrollment")
+		except Exception as exc:
+			_add_check(checks, "enrollment_created_at_utc", False, _safe_exception_message(exc))
+	else:
+		_add_check(checks, "enrollment_created_at_utc", False, "created_at_utc is missing")
+	try:
+		_verify_identity_signature(identity)
+		_add_check(checks, "identity_signature", True, str(fingerprint))
+	except Exception as exc:
+		message = _safe_exception_message(exc)
+		if created_skew is not None and abs(created_skew) > CLOCK_SKEW_LIMIT_SECONDS:
+			message = f"{message}; clock skew is a likely cause"
+		_add_check(checks, "identity_signature", False, message, hint=IDENTITY_SIGNATURE_HINT)
 	return _doctor_report(checks)
 
 
@@ -1047,8 +1124,33 @@ def _doctor_server(workspace: Path) -> dict[str, Any]:
 	return _doctor_report(checks)
 
 
-def _add_check(checks: list[dict[str, Any]], name: str, ok: bool, message: str) -> None:
-	checks.append({"name": name, "ok": ok, "message": message})
+def _add_check(checks: list[dict[str, Any]], name: str, ok: bool, message: str, **fields: Any) -> None:
+	record = {"name": name, "ok": ok, "message": message}
+	record.update({key: value for key, value in fields.items() if value is not None})
+	checks.append(record)
+
+
+def _add_clock_skew_check(checks: list[dict[str, Any]], reference_time: datetime, label: str) -> int:
+	local_time = _utc_now()
+	skew = int(round((local_time - reference_time).total_seconds()))
+	ok = abs(skew) <= CLOCK_SKEW_LIMIT_SECONDS
+	_add_check(
+		checks,
+		"clock_skew_seconds",
+		ok,
+		_clock_skew_message(skew, label),
+		clock_skew_seconds=skew,
+		local_time_utc=_format_utc(local_time),
+		reference_time_utc=_format_utc(reference_time),
+	)
+	return skew
+
+
+def _clock_skew_message(skew_seconds: int, label: str) -> str:
+	if skew_seconds == 0:
+		return f"local clock matches {label} UTC time"
+	direction = "ahead of" if skew_seconds > 0 else "behind"
+	return f"local clock is {abs(skew_seconds)} seconds {direction} {label} UTC time"
 
 
 def _doctor_report(checks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1059,6 +1161,23 @@ def _safe_exception_message(exc: Exception) -> str:
 	if isinstance(exc, EndpointError):
 		return f"{exc.code}: {exc.message}"
 	return type(exc).__name__
+
+
+def _utc_now() -> datetime:
+	return datetime.now(UTC).replace(microsecond=0)
+
+
+def _format_utc(value: datetime) -> str:
+	return value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc_iso(value: str, field: str) -> datetime:
+	try:
+		parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+	except Exception as exc:
+		raise EndpointError("invalid_envelope", f"{field} must be an ISO UTC timestamp", detail=type(exc).__name__) from exc
+	require(parsed.tzinfo is not None, "invalid_envelope", f"{field} must include UTC offset")
+	return parsed.astimezone(UTC).replace(microsecond=0)
 
 
 if __name__ == "__main__":

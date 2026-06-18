@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ from endpoint import cli
 from endpoint.config import load_server_config
 from endpoint.credentials import generate_client_token, hash_client_token, validate_client_token_strength, verify_client_token
 from endpoint.errors import EndpointError
-from endpoint.protocol import parse_json_strict
+from endpoint.protocol import canonical_json_bytes, parse_json_strict
 from endpoint.server_core import create_app
 from endpoint.transport import httpx_verify_config
 
@@ -81,6 +82,18 @@ def test_token_commands_generate_and_hash_client_tokens(capsys: pytest.CaptureFi
 	assert cli.main(["token", "hash", f"token={token}"]) == 0
 	hash_output = parse_json_strict(capsys.readouterr().out)
 	assert verify_client_token(token, hash_output["client_token_hash"])
+
+
+def test_endpoint_error_safe_body_includes_hint_without_debug_detail() -> None:
+	error = EndpointError("invalid_identity_signature", "identity signature does not verify", detail="SignatureInvalid: no valid signature", hint="Sync clocks and retry.")
+	safe = error.safe_body()
+	assert safe["error"] == {
+		"code": "invalid_identity_signature",
+		"message": "identity signature does not verify",
+		"hint": "Sync clocks and retry.",
+	}
+	debug = error.safe_body(debug=True)
+	assert debug["error"]["detail"] == "SignatureInvalid: no valid signature"
 
 
 def test_cli_reports_usage_and_endpoint_errors_safely(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -189,6 +202,11 @@ def test_setup_bundles_do_not_include_private_keys_and_profiles_resolve_paths(tm
 	join_output = parse_json_strict(capsys.readouterr().out)
 	assert join_output["profile"] == str(guest / "profile.json")
 	assert_zip_has_no_private_key(enrollment)
+	assert cli.main(["doctor", f"enrollment={enrollment}"]) == 0
+	enrollment_report = parse_json_strict(capsys.readouterr().out)
+	enrollment_checks = {check["name"]: check for check in enrollment_report["checks"]}
+	assert enrollment_checks["enrollment_readable"]["ok"] is True
+	assert enrollment_checks["identity_signature"]["ok"] is True
 	profile = cli._load_client_profile(guest / "profile.json")
 	assert Path(profile["ca_bundle"]) == guest / "ca.pem"
 	assert Path(profile["key_store_dir"]) == guest / "keys"
@@ -199,6 +217,105 @@ def test_setup_bundles_do_not_include_private_keys_and_profiles_resolve_paths(tm
 	config = load_server_config(host / "server.json")
 	assert set(config.hosted_identities) == {"alice", "bob"}
 	assert set(config.client_token_hashes) == {"alice", "bob"}
+	assert cli.main(["setup", "enroll", f"workspace={host}", f"enrollment={enrollment}"]) == 1
+	missing_pending = parse_json_strict(capsys.readouterr().err)
+	assert missing_pending["error"]["message"] == "pending invite was not found for this enrollment"
+
+
+def test_doctor_enrollment_reports_tampered_signature_with_safe_hint(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+	host = tmp_path / "host"
+	guest = tmp_path / "guest"
+	invite = tmp_path / "bob.endpoint-invite.zip"
+	enrollment = tmp_path / "bob.endpoint-enrollment.zip"
+	tampered = tmp_path / "bob.tampered-enrollment.zip"
+	port = free_port()
+	url = f"https://127.0.0.1:{port}"
+	assert cli.main([
+		"setup",
+		"host-init",
+		f"workspace={host}",
+		f"server_url={url}",
+		"bind_host=127.0.0.1",
+		f"port={port}",
+		"owner_ref=alice",
+		"owner_name=Alice",
+	]) == 0
+	capsys.readouterr()
+	assert cli.main(["setup", "invite", f"workspace={host}", "client_ref=bob", f"out={invite}"]) == 0
+	capsys.readouterr()
+	assert cli.main(["setup", "join", f"invite={invite}", f"workspace={guest}", "name=Bob", f"out={enrollment}"]) == 0
+	capsys.readouterr()
+	write_tampered_enrollment(enrollment, tampered)
+	assert cli.main(["doctor", f"enrollment={tampered}"]) == 1
+	report = parse_json_strict(capsys.readouterr().out)
+	checks = {check["name"]: check for check in report["checks"]}
+	assert checks["identity_signature"]["ok"] is False
+	assert checks["identity_signature"]["hint"] == cli.IDENTITY_SIGNATURE_HINT
+	assert "PRIVATE KEY" not in checks["identity_signature"]["message"]
+
+
+def test_health_includes_utc_time_and_doctor_reports_clock_skew(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+	host = tmp_path / "host"
+	port = free_port()
+	url = f"https://127.0.0.1:{port}"
+	assert cli.main([
+		"setup",
+		"host-init",
+		f"workspace={host}",
+		f"server_url={url}",
+		"bind_host=127.0.0.1",
+		f"port={port}",
+		"owner_ref=alice",
+		"owner_name=Alice",
+	]) == 0
+	capsys.readouterr()
+	app = create_app(load_server_config(host / "server.json"))
+	profile = host / "clients" / "alice" / "profile.json"
+	with RunningServer(app, port, host / "tls" / "server.pem", host / "tls" / "server.key", host / "tls" / "ca.pem"):
+		response = httpx.get(f"{url}/v1/health", verify=httpx_verify_config(str(host / "tls" / "ca.pem")), timeout=2.0)
+		body = response.json()
+		assert body["status"] == "ok"
+		assert cli._parse_utc_iso(body["server_time_utc"], "server_time_utc").tzinfo is not None
+		monkeypatch.setattr(cli, "_utc_now", lambda: datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=5))
+		assert cli.main(["doctor", f"profile={profile}"]) == 1
+		report = parse_json_strict(capsys.readouterr().out)
+		checks = [check for check in report["checks"] if check["name"] == "clock_skew_seconds"]
+		assert checks
+		assert checks[0]["ok"] is False
+		assert checks[0]["clock_skew_seconds"] >= 250
+
+
+def test_doctor_profile_detects_fake_future_health_time(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+	profile_path = tmp_path / "profile.json"
+	local_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+	cli._write_json_file(profile_path, {
+		"protocol_version": "endpoint-poc-1",
+		"kind": "endpoint-client-profile",
+		"client_ref": "bob",
+		"home_server_url": "https://127.0.0.1:8443",
+		"auth_token": generate_client_token(),
+		"state_dir": "state",
+		"key_store_dir": "keys",
+		"ca_bundle": False,
+		"identity_path": "identity.json",
+		"contacts_dir": "contacts",
+		"metadata": {"username": "bob"},
+	})
+	class FakeResponse:
+		status_code = 200
+		text = canonical_json_bytes({
+			"status": "ok",
+			"server_time_utc": "2026-01-01T12:05:00Z",
+		}).decode("utf-8")
+
+	monkeypatch.setattr(cli, "_utc_now", lambda: local_now)
+	monkeypatch.setattr(cli.httpx, "get", lambda *args, **kwargs: FakeResponse())
+	assert cli.main(["doctor", f"profile={profile_path}"]) == 1
+	report = parse_json_strict(capsys.readouterr().out)
+	checks = [check for check in report["checks"] if check["name"] == "clock_skew_seconds"]
+	assert checks
+	assert checks[0]["clock_skew_seconds"] == -300
+	assert checks[0]["ok"] is False
 
 
 def test_doctor_reports_common_profile_failures(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -431,3 +548,14 @@ def assert_zip_has_no_private_key(path: Path) -> None:
 			assert "private" not in name.lower()
 			data = archive.read(name)
 			assert b"PRIVATE KEY BLOCK" not in data
+
+
+def write_tampered_enrollment(source: Path, target: Path) -> None:
+	with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+		for name in src.namelist():
+			data = src.read(name)
+			if name == "identity.json":
+				identity = parse_json_strict(data)
+				identity["metadata"] = {"username": "bob", "display_name": "Mallory"}
+				data = canonical_json_bytes(identity)
+			dst.writestr(name, data)
