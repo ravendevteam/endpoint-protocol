@@ -1,6 +1,8 @@
+/.direnv/
 dist/
 build/
 openpgp-sequoia/target/
+result/
 __pycache__/
 .pytest_cache/
 *.egg-info/
