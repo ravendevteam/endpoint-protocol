@@ -316,6 +316,10 @@ def test_doctor_profile_detects_fake_future_health_time(tmp_path: Path, capsys: 
 	assert checks
 	assert checks[0]["clock_skew_seconds"] == -300
 	assert checks[0]["ok"] is False
+	assert cli.main(["receive", f"profile={profile_path}"]) == 1
+	error = parse_json_strict(capsys.readouterr().err)
+	assert error["error"]["code"] == "clock_skew"
+	assert error["error"]["hint"] == cli.CLOCK_SKEW_HINT
 
 
 def test_doctor_reports_common_profile_failures(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

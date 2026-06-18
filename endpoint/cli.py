@@ -38,6 +38,7 @@ class CliUsageError(Exception):
 
 
 IDENTITY_SIGNATURE_HINT = "Sync system clocks, regenerate the identity or enrollment bundle, and retry."
+CLOCK_SKEW_HINT = "Sync system clocks with UTC and retry. On Windows, run: w32tm /resync."
 CLOCK_SKEW_LIMIT_SECONDS = 30
 
 
@@ -478,6 +479,7 @@ def _cmd_send(tokens: list[str]) -> int:
 	_require_arguments(values, {"body"})
 	if "profile" in values:
 		profile = _load_client_profile(Path(values["profile"]))
+		_require_profile_clock_sync(profile)
 		client_values = _client_values_from_profile(profile)
 		client = _client_from_values(client_values)
 		sender_metadata = _metadata_from_values(values) if "metadata_json" in values else profile.get("metadata")
@@ -519,6 +521,7 @@ def _cmd_receive(tokens: list[str]) -> int:
 	)
 	if "profile" in values:
 		profile = _load_client_profile(Path(values["profile"]))
+		_require_profile_clock_sync(profile)
 		client_values = _client_values_from_profile(profile)
 	else:
 		_require_arguments(values, {"client_ref", "home_server_url", "auth_token", "state_dir", "key_store_dir"})
@@ -1132,7 +1135,7 @@ def _add_check(checks: list[dict[str, Any]], name: str, ok: bool, message: str, 
 
 def _add_clock_skew_check(checks: list[dict[str, Any]], reference_time: datetime, label: str) -> int:
 	local_time = _utc_now()
-	skew = int(round((local_time - reference_time).total_seconds()))
+	skew = _clock_skew_seconds(reference_time, local_time)
 	ok = abs(skew) <= CLOCK_SKEW_LIMIT_SECONDS
 	_add_check(
 		checks,
@@ -1144,6 +1147,30 @@ def _add_clock_skew_check(checks: list[dict[str, Any]], reference_time: datetime
 		reference_time_utc=_format_utc(reference_time),
 	)
 	return skew
+
+
+def _require_profile_clock_sync(profile: dict[str, Any]) -> None:
+	server_time = _fetch_server_utc_time(profile)
+	skew = _clock_skew_seconds(server_time, _utc_now())
+	if abs(skew) > CLOCK_SKEW_LIMIT_SECONDS:
+		raise EndpointError("clock_skew", _clock_skew_message(skew, "server"), hint=CLOCK_SKEW_HINT)
+
+
+def _fetch_server_utc_time(profile: dict[str, Any]) -> datetime:
+	try:
+		response = httpx.get(f"{profile['home_server_url']}/v1/health", verify=httpx_verify_config(_verify_tls_from_values(profile)), timeout=2.0, follow_redirects=False)
+	except Exception as exc:
+		raise EndpointError("server_unreachable", "server health check failed", detail=type(exc).__name__) from exc
+	require(response.status_code == 200, "server_unreachable", "server health check failed", detail=f"status={response.status_code}")
+	health = parse_json_strict(response.text)
+	require(isinstance(health, dict), "invalid_envelope", "health response must be an object")
+	server_time = health.get("server_time_utc")
+	require(isinstance(server_time, str) and server_time != "", "invalid_envelope", "health response is missing server_time_utc")
+	return _parse_utc_iso(server_time, "server_time_utc")
+
+
+def _clock_skew_seconds(reference_time: datetime, local_time: datetime) -> int:
+	return int(round((local_time - reference_time).total_seconds()))
 
 
 def _clock_skew_message(skew_seconds: int, label: str) -> str:
