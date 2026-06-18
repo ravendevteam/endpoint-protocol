@@ -13,8 +13,8 @@
 			"aarch64-darwin"
 		];
 
-		perSystem = { config, pkgs, system, ... }: {
-			checks.pytest = pkgs.python312.pkgs.buildPythonPackage {
+		perSystem = { config, pkgs, ... }: {
+			checks.default = pkgs.python312.pkgs.buildPythonPackage {
 				pname = "endpoint-tests";
 				version = "0.1.0";
 				format = "other";
@@ -50,9 +50,17 @@
 
 				preCheck = ''
 					export PATH="${config.packages.endpoint-openpgp-sequoia}/bin:$PATH"
+					export PYTHONPATH="${config.packages.endpoint-openpgp-sequoia}/lib:${config.packages.endpoint-openpgp-sequoia}/bin:$PYTHONPATH"
 					export SEQUOIA_BINARY_PATH="${config.packages.endpoint-openpgp-sequoia}/bin/endpoint-openpgp-sequoia"
+				
+					mkdir -p . && cd .
+					for f in ${config.packages.endpoint-openpgp-sequoia}/lib/*endpoint_openpgp_sequoia*; do
+						if [ -f "$f" ]; then
+							ln -s "$f" "./$(basename "$f" | sed 's/^lib//')" 2>/dev/null || true
+						fi
+					done
 				'';
-						
+				
 				dontBuild = true;
 				dontInstall = true;
 			};
@@ -79,7 +87,6 @@
 				pname = "endpoint-protocol";
 				version = "0.1.0";
 				format = "pyproject";
-
 				src = ./.;
 
 				nativeBuildInputs = [
