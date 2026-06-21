@@ -72,51 +72,53 @@ For local development, the repository also includes a Nix flake. The Nix environ
 
 ### Install From Release
 
-Current releases provide prebuilt wheels for Windows x86_64. Other platforms must build the endpoint-openpgp-sequoia backend from source until additional prebuilt wheels are published.
+Download the release assets for your platform from the GitHub Release. Releases include the protocol wheel, prebuilt endpoint-openpgp-sequoia backend wheels for supported platforms, and SHA-256 hashes for the assets. Download endpoint_protocol-0.1.0-py3-none-any.whl and the endpoint_openpgp_sequoia wheel that matches your operating system and CPU architecture. Verify the downloaded files before installing them.
 
-Download the Windows x86_64 release assets from the GitHub Release. Releases include the Endpoint protocol wheel, the Windows x86_64 endpoint-openpgp-sequoia wheel, and SHA-256 hashes for the assets.
-
-Verify the downloaded files before installing them. On Windows in PowerShell:
+On Windows in PowerShell:
 ```
 Get-FileHash .\endpoint_protocol-0.1.0-py3-none-any.whl -Algorithm SHA256
-Get-FileHash .\endpoint_openpgp_sequoia-0.1.0-cp311-abi3-win_amd64.whl -Algorithm SHA256
+Get-FileHash .\endpoint_openpgp_sequoia-0.1.0-*.whl -Algorithm SHA256
 ```
 
-After the hashes match the release notes, install both wheels together:
+On Linux:
 ```
-python -m pip install .\endpoint_openpgp_sequoia-0.1.0-cp311-abi3-win_amd64.whl .\endpoint_protocol-0.1.0-py3-none-any.whl
-```
-
-For non-Windows platforms, build the OpenPGP backend locally and install the generated backend wheel with the Endpoint protocol wheel:
-```
-cd openpgp-sequoia
-python -m pip install maturin
-maturin build --release --out ../dist
-python -m pip install ../dist/endpoint_openpgp_sequoia-*.whl ../dist/endpoint_protocol-0.1.0-py3-none-any.whl
+sha256sum endpoint_protocol-0.1.0-py3-none-any.whl
+sha256sum endpoint_openpgp_sequoia-0.1.0-*.whl
 ```
 
-To build the Windows x86_64 release wheels locally from the repository root:
+On macOS:
+```
+shasum -a 256 endpoint_protocol-0.1.0-py3-none-any.whl
+shasum -a 256 endpoint_openpgp_sequoia-0.1.0-*.whl
+```
+
+After the hashes match the release notes, install both wheels together. On Windows in PowerShell:
+```
+$backend = Get-ChildItem .\endpoint_openpgp_sequoia-0.1.0-*.whl | Select-Object -First 1
+python -m pip install $backend.FullName .\endpoint_protocol-0.1.0-py3-none-any.whl
+```
+
+On macOS or Linux:
+```
+python -m pip install ./endpoint_openpgp_sequoia-0.1.0-*.whl ./endpoint_protocol-0.1.0-py3-none-any.whl
+```
+
+To build the wheels locally from the repository root instead of using release assets:
 ```
 python -m pip install --upgrade pip wheel setuptools maturin
 python -m pip wheel . --no-deps --no-build-isolation -w dist
 python -m maturin build --manifest-path openpgp-sequoia/Cargo.toml --release --out dist
-$wheels = @(
-  (Get-ChildItem dist\endpoint_protocol-*.whl).FullName
-  (Get-ChildItem dist\endpoint_openpgp_sequoia-*.whl).FullName
-)
-Compress-Archive -Path $wheels -DestinationPath dist\endpoint-demo-wheels-0.1.0.zip -Force
 ```
 
-To create a SHA-256 manifest for the release assets:
+Install the locally built wheels. On Windows in PowerShell:
 ```
-$assets = @(
-  (Get-ChildItem dist\endpoint_protocol-*.whl).FullName
-  (Get-ChildItem dist\endpoint_openpgp_sequoia-*.whl).FullName
-  (Get-ChildItem dist\endpoint-demo-wheels-*.zip).FullName
-)
-Get-FileHash $assets -Algorithm SHA256 |
-  ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
-  Set-Content dist\SHA256SUMS.txt
+$backend = Get-ChildItem .\dist\endpoint_openpgp_sequoia-*.whl | Select-Object -First 1
+python -m pip install $backend.FullName .\dist\endpoint_protocol-0.1.0-py3-none-any.whl
+```
+
+On macOS or Linux:
+```
+python -m pip install dist/endpoint_openpgp_sequoia-*.whl dist/endpoint_protocol-0.1.0-py3-none-any.whl
 ```
 
 ### How to Run the Demo
