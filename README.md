@@ -78,13 +78,13 @@ Download the Windows x86_64 release assets from the GitHub Release. Releases inc
 
 Verify the downloaded files before installing them. On Windows in PowerShell:
 ```
-Get-FileHash .\endpoint_protocol-0.1.0-py3-none-any.whl -Algorithm SHA256
-Get-FileHash .\endpoint_openpgp_sequoia-0.1.0-cp311-abi3-win_amd64.whl -Algorithm SHA256
+Get-FileHash .\endpoint_protocol-py3-none-any.whl -Algorithm SHA256
+Get-FileHash .\endpoint_openpgp_sequoia-cp311-abi3-win_amd64.whl -Algorithm SHA256
 ```
 
 After the hashes match the release notes, install both wheels together:
 ```
-python -m pip install .\endpoint_openpgp_sequoia-0.1.0-cp311-abi3-win_amd64.whl .\endpoint_protocol-0.1.0-py3-none-any.whl
+python -m pip install .\endpoint_openpgp_sequoia-cp311-abi3-win_amd64.whl .\endpoint_protocol-py3-none-any.whl
 ```
 
 For non-Windows platforms, build the OpenPGP backend locally and install the generated backend wheel with the Endpoint protocol wheel:
@@ -92,7 +92,31 @@ For non-Windows platforms, build the OpenPGP backend locally and install the gen
 cd openpgp-sequoia
 python -m pip install maturin
 maturin build --release --out ../dist
-python -m pip install ../dist/endpoint_openpgp_sequoia-*.whl ../dist/endpoint_protocol-0.1.0-py3-none-any.whl
+python -m pip install ../dist/endpoint_openpgp_sequoia-*.whl ../dist/endpoint_protocol-py3-none-any.whl
+```
+
+To build the Windows x86_64 release wheels locally from the repository root:
+```
+python -m pip install --upgrade pip wheel setuptools maturin
+python -m pip wheel . --no-deps --no-build-isolation -w dist
+python -m maturin build --manifest-path openpgp-sequoia/Cargo.toml --release --out dist
+$wheels = @(
+  (Get-ChildItem dist\endpoint_protocol-*.whl).FullName
+  (Get-ChildItem dist\endpoint_openpgp_sequoia-*.whl).FullName
+)
+Compress-Archive -Path $wheels -DestinationPath dist\endpoint-demo-wheels-0.1.0.zip -Force
+```
+
+To create a SHA-256 manifest for the release assets:
+```
+$assets = @(
+  (Get-ChildItem dist\endpoint_protocol-*.whl).FullName
+  (Get-ChildItem dist\endpoint_openpgp_sequoia-*.whl).FullName
+  (Get-ChildItem dist\endpoint-demo-wheels-*.zip).FullName
+)
+Get-FileHash $assets -Algorithm SHA256 |
+  ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+  Set-Content dist\SHA256SUMS.txt
 ```
 
 ### How to Run the Demo
