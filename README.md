@@ -68,7 +68,7 @@ The demo requires:
 - The Python dependencies listed in pyproject.toml, and
 - A shell environment where the endpoint CLI is available.
 
-For local development, the repository also includes a Nix flake. The Nix environment is intended to provide the Python, Rust, OpenPGP backend, and test dependencies needed to work on the project.
+For local development, the repository also includes a Nix flake. The Nix environment is intended to provide the Python, Rust OpenPGP backend, and test dependencies needed to work on the project.
 
 ### Install From Release
 
@@ -78,13 +78,13 @@ Download the Windows x86_64 release assets from the GitHub Release. Releases inc
 
 Verify the downloaded files before installing them. On Windows in PowerShell:
 ```
-Get-FileHash .\endpoint_protocol-py3-none-any.whl -Algorithm SHA256
-Get-FileHash .\endpoint_openpgp_sequoia-cp311-abi3-win_amd64.whl -Algorithm SHA256
+Get-FileHash .\endpoint_protocol-0.1.0-py3-none-any.whl -Algorithm SHA256
+Get-FileHash .\endpoint_openpgp_sequoia-0.1.0-cp311-abi3-win_amd64.whl -Algorithm SHA256
 ```
 
 After the hashes match the release notes, install both wheels together:
 ```
-python -m pip install .\endpoint_openpgp_sequoia-cp311-abi3-win_amd64.whl .\endpoint_protocol-py3-none-any.whl
+python -m pip install .\endpoint_openpgp_sequoia-0.1.0-cp311-abi3-win_amd64.whl .\endpoint_protocol-0.1.0-py3-none-any.whl
 ```
 
 For non-Windows platforms, build the OpenPGP backend locally and install the generated backend wheel with the Endpoint protocol wheel:
@@ -92,7 +92,7 @@ For non-Windows platforms, build the OpenPGP backend locally and install the gen
 cd openpgp-sequoia
 python -m pip install maturin
 maturin build --release --out ../dist
-python -m pip install ../dist/endpoint_openpgp_sequoia-*.whl ../dist/endpoint_protocol-py3-none-any.whl
+python -m pip install ../dist/endpoint_openpgp_sequoia-*.whl ../dist/endpoint_protocol-0.1.0-py3-none-any.whl
 ```
 
 To build the Windows x86_64 release wheels locally from the repository root:
