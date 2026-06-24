@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "endpoint-openpgp-sequoia"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 description = "Sequoia OpenPGP backend for Endpoint Protocol"
 
 [tool.maturin]
