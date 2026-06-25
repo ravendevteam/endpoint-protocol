@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .errors import EndpointError, require
+from .transport import normalize_server_url
 
 PROTOCOL_VERSION = "endpoint-poc-1"
 MAX_METADATA_BYTES = 16 * 1024
@@ -124,6 +125,10 @@ def validate_route(route: Any) -> None:
 	require(isinstance(route.get("server_url"), str), "invalid_envelope", "route.server_url is required")
 	require(isinstance(route.get("client_ref"), str), "invalid_envelope", "route.client_ref is required")
 	require(route["client_ref"] != "", "invalid_envelope", "route.client_ref is required")
+	try:
+		normalize_server_url(route["server_url"])
+	except EndpointError as exc:
+		raise EndpointError("invalid_envelope", "route.server_url is invalid", detail=exc.code) from exc
 
 
 def validate_identity_envelope(identity: Any, limits: ProtocolLimits | None = None) -> None:

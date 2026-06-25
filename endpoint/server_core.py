@@ -21,7 +21,7 @@ from .protocol import (
 	validate_identity_envelope,
 )
 from .storage import MessageQueue, ReplayStore, StructuredLog
-from .transport import FederationPolicy, httpx_verify_config, validate_https_url
+from .transport import FederationPolicy, httpx_verify_config, normalize_server_url, validate_https_url
 
 SAFE_REJECT_REASONS = {"malformed_ciphertext", "wrong_recipient", "signature_invalid", "outer_inner_mismatch", "invalid_envelope"}
 
@@ -248,7 +248,7 @@ def _response_json_object(response: httpx.Response, max_size: int, size_message:
 
 
 def _normalize_configured_url(url: str) -> str:
-	return url.rstrip("/").lower()
+	return normalize_server_url(url)
 
 
 async def _request_json_object(request: Request) -> dict[str, Any]:

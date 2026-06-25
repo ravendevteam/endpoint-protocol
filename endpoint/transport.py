@@ -24,9 +24,17 @@ def normalize_server_url(url: str) -> str:
 	require(parsed.scheme == "https", "url_policy_denied", "server URLs must use https")
 	require(bool(parsed.hostname), "url_policy_denied", "server URL host is required")
 	require(parsed.username is None and parsed.password is None, "url_policy_denied", "URL credentials are not allowed")
+	require(parsed.path in {"", "/"}, "url_policy_denied", "server URL paths are not allowed")
+	require(parsed.params == "", "url_policy_denied", "URL params are not allowed")
+	require(parsed.query == "", "url_policy_denied", "URL query strings are not allowed")
 	require(parsed.fragment == "", "url_policy_denied", "URL fragments are not allowed")
-	port = parsed.port
+	try:
+		port = parsed.port
+	except ValueError as exc:
+		raise EndpointError("url_policy_denied", "server URL port is invalid", detail=str(exc)) from exc
 	host = parsed.hostname.lower()
+	if ":" in host and not host.startswith("["):
+		host = f"[{host}]"
 	if port is None:
 		return f"https://{host}"
 	return f"https://{host}:{port}"

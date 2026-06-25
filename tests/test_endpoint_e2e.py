@@ -25,7 +25,7 @@ from endpoint.crypto import OpenPgpContext, canonical_public_key_bytes, endpoint
 from endpoint.errors import EndpointError
 from endpoint.protocol import PROTOCOL_VERSION, canonical_json_bytes, parse_json_strict, validate_encrypted_envelope, validate_metadata
 from endpoint.server_core import ServerConfig, create_app
-from endpoint.transport import FederationPolicy, httpx_verify_config, validate_https_url
+from endpoint.transport import FederationPolicy, httpx_verify_config, normalize_server_url, validate_https_url
 
 
 def free_port() -> int:
@@ -193,6 +193,13 @@ def trace_identity(trace: Any, label: str, identity: dict[str, Any]) -> None:
 	)
 
 
+def client_state_json(client: EndpointClient, name: str, default: Any) -> Any:
+	path = client.state.state_dir / name
+	if not path.exists():
+		return default
+	return json.loads(path.read_text(encoding="utf-8"))
+
+
 def make_fake_peer_app(mode: str, identity: dict[str, Any] | None = None) -> FastAPI:
 	app = FastAPI()
 
@@ -279,9 +286,12 @@ def test_server_json_config_loading_is_strict_and_hash_only(tmp_path: Path, trac
 	client = make_client(tmp_path, "alice", url, token)
 	identity = client.export_identity({"username": "alice"})
 	document = make_server_config_document(tmp_path, "config-valid", url, identity, token_hash, (port,), {url})
+	document["server_url"] = f"https://LOCALHOST:{port}/"
+	document["federation_policy"]["outbound_whitelist"] = [f"https://LOCALHOST:{port}/"]
 	config_path = write_config(tmp_path / "server.json", document)
 	config = load_server_config(config_path)
-	assert config.server_url == url
+	assert config.server_url == f"https://localhost:{port}"
+	assert config.federation_policy.outbound_whitelist == {f"https://localhost:{port}"}
 	assert config.client_token_hashes["alice"] == token_hash
 	create_app(config)
 	trace("valid JSON server config loaded and created an app using hashed client credentials")
@@ -427,10 +437,16 @@ async def test_identity_discovery_auth_trust_and_metadata_tamper(tmp_path: Path,
 		assert result.identity["endpoint_fingerprint"] == identity_b["endpoint_fingerprint"]
 		assert result.trust_state == "untrusted"
 		assert result.route_warning is None
+		assert result.pin_state is None
 		trace(
 			"Client A discovered Bob through Server A -> Server B; "
 			f"fingerprint={short_fingerprint(result.identity['endpoint_fingerprint'])}, trust=untrusted"
 		)
+		pinned = await client_a.discover(url_b, "bob", identity_b["endpoint_fingerprint"])
+		assert pinned.pin_state == "matched"
+		assert pinned.trust_state == "untrusted"
+		assert client_a.state.contact_pin(url_b, "bob") == identity_b["endpoint_fingerprint"]
+		trace("Client A repeated discovery with Bob's out-of-band fingerprint pin and saw a matching identity")
 		client_a.mark_trusted(result.identity["endpoint_fingerprint"])
 		assert client_a.trust_state(result.identity["endpoint_fingerprint"]) == "trusted"
 		trace("Client A explicitly marked Bob's fingerprint trusted")
@@ -444,6 +460,56 @@ async def test_identity_discovery_auth_trust_and_metadata_tamper(tmp_path: Path,
 			await client_a.discover(url_b, "bob")
 		assert exc.value.code == "invalid_identity_signature"
 		trace("Client A rejected the tampered identity because the metadata signature no longer verified")
+
+
+@pytest.mark.asyncio
+async def test_pinned_first_contact_mismatch_is_atomic_and_recoverable(tmp_path: Path, trace: Any) -> None:
+	cert_path, key_path, ca_path = make_tls(tmp_path)
+	port_a, port_b = free_port(), free_port()
+	url_a, url_b = f"https://127.0.0.1:{port_a}", f"https://127.0.0.1:{port_b}"
+	client_a = make_client(tmp_path, "alice", url_a, "alice-token")
+	client_b_real = make_client(tmp_path, "bob-real", url_b, "bob-token")
+	client_b_attacker = make_client(tmp_path, "bob-attacker", url_b, "bob-token")
+	client_b_real.client_ref = "bob"
+	client_b_attacker.client_ref = "bob"
+	identity_a = client_a.export_identity({"username": "alice"})
+	identity_b_real = client_b_real.export_identity({"username": "bob", "display_name": "Bob"})
+	identity_b_attacker = client_b_attacker.export_identity({"username": "bob", "display_name": "Bob"})
+	assert identity_b_attacker["endpoint_fingerprint"] != identity_b_real["endpoint_fingerprint"]
+	trace_identity(trace, "real out-of-band Bob contact identity", identity_b_real)
+	trace_identity(trace, "malicious first-contact substitute identity", identity_b_attacker)
+	app_a1 = create_app(make_server_config(tmp_path, "atomic-a1", url_a, identity_a, "alice-token", (port_a, port_b), {url_b}))
+	app_b_bad = create_app(make_server_config(tmp_path, "atomic-bad", url_b, identity_b_attacker, "bob-token", (port_a, port_b), {url_a}))
+	with RunningServer(app_a1, port_a, cert_path, key_path, ca_path), RunningServer(app_b_bad, port_b, cert_path, key_path, ca_path):
+		with pytest.raises(EndpointError) as exc:
+			await client_a.discover(url_b, "bob", identity_b_real["endpoint_fingerprint"])
+		assert exc.value.code == "contact_fingerprint_mismatch"
+		assert client_state_json(client_a, "identities.json", {}) == {}
+		assert client_state_json(client_a, "routes.json", {}) == {}
+		assert client_state_json(client_a, "contact_pins.json", {}) == {}
+		trace("pinned first-contact discovery rejected the substitute before writing identity, route, or pin state")
+	app_a2 = create_app(make_server_config(tmp_path, "atomic-a2", url_a, identity_a, "alice-token", (port_a, port_b), {url_b}))
+	app_b_real = create_app(make_server_config(tmp_path, "atomic-real", url_b, identity_b_real, "bob-token", (port_a, port_b), {url_a}))
+	with RunningServer(app_a2, port_a, cert_path, key_path, ca_path), RunningServer(app_b_real, port_b, cert_path, key_path, ca_path):
+		recovered = await client_a.discover(url_b, "bob", identity_b_real["endpoint_fingerprint"])
+		assert recovered.pin_state == "matched"
+		assert recovered.route_warning is None
+		assert recovered.trust_state == "untrusted"
+		reloaded = EndpointClient(
+			client_ref="alice",
+			home_server_url=url_a,
+			auth_token="alice-token",
+			key_store_dir=tmp_path / "clients" / "alice" / "openpgp",
+			state_dir=tmp_path / "clients" / "alice" / "state",
+			verify_tls=str(ca_path),
+		)
+		assert reloaded.state.contact_pin(url_b, "bob") == identity_b_real["endpoint_fingerprint"]
+		persisted = await reloaded.discover(f"{url_b}/", "bob", reloaded.state.contact_pin(url_b, "bob"))
+		assert persisted.pin_state == "matched"
+		assert reloaded.state.contact_pin(url_b, "bob") == identity_b_real["endpoint_fingerprint"]
+		assert client_state_json(reloaded, "identities.json", {}) == {identity_b_real["endpoint_fingerprint"]: identity_b_real}
+		assert client_state_json(reloaded, "routes.json", {}) == {f"{url_b}|bob": [identity_b_real["endpoint_fingerprint"]]}
+		trace("the same imported pin survived client reload and the correct Bob identity was discoverable afterward")
 
 
 @pytest.mark.asyncio
@@ -476,9 +542,10 @@ async def test_full_exchange_offline_online_wss_ack_and_plaintext_absence(tmp_pa
 		assert [message.body for message in messages_b] == [body_ab]
 		assert messages_b[0].sender_metadata == {"username": "alice"}
 		assert messages_b[0].sender_trust_state == "untrusted"
+		assert client_b.state.contact_pin(url_a, "alice") is None
 		trace(
 			"Bob connected over WSS, received the queued envelope, decrypted it, "
-			"verified Alice's signature, and saw Alice as untrusted"
+			"verified Alice's signature, and saw Alice as untrusted without auto-pinning her"
 		)
 		assert app_b.state.endpoint.queue.count_active("bob") == 0
 		trace("Bob acked over WSS; Server B removed the queued message from active queue state")
@@ -494,6 +561,7 @@ async def test_full_exchange_offline_online_wss_ack_and_plaintext_absence(tmp_pa
 		messages_a = await client_a.receive_messages(limit=1, timeout=5)
 		assert [message.body for message in messages_a] == [body_ba]
 		assert messages_a[0].sender_metadata is None
+		assert client_a.state.contact_pin(url_b, "bob") is None
 		trace("Alice received Bob's reply over WSS and verified/decrypted it successfully")
 	for root in (tmp_path / "servers").iterdir():
 		assert_no_server_private_key_material(root)
@@ -527,6 +595,18 @@ async def test_route_key_change_is_new_untrusted_identity(tmp_path: Path, trace:
 	app_a2 = create_app(make_server_config(tmp_path, "a2", url_a, identity_a, "alice-token", (port_a, port_b), {url_b}))
 	app_b2 = create_app(make_server_config(tmp_path, "b2", url_b, identity_b2, "bob-token", (port_a, port_b), {url_a}))
 	with RunningServer(app_a2, port_a, cert_path, key_path, ca_path), RunningServer(app_b2, port_b, cert_path, key_path, ca_path):
+		identities_path = tmp_path / "clients" / "alice" / "state" / "identities.json"
+		identities_before = parse_json_strict(identities_path.read_text(encoding="utf-8"))
+		routes_before = client_state_json(client_a, "routes.json", {})
+		pins_before = client_state_json(client_a, "contact_pins.json", {})
+		with pytest.raises(EndpointError) as pinned_exc:
+			await client_a.discover(url_b, "bob", first.identity["endpoint_fingerprint"])
+		assert pinned_exc.value.code == "contact_fingerprint_mismatch"
+		identities_after = parse_json_strict(identities_path.read_text(encoding="utf-8"))
+		assert identities_after == identities_before
+		assert client_state_json(client_a, "routes.json", {}) == routes_before
+		assert client_state_json(client_a, "contact_pins.json", {}) == pins_before
+		trace("pinned discovery rejected the substituted Bob key before storing it")
 		second = await client_a.discover(url_b, "bob")
 		assert second.route_warning == "route_key_changed"
 		assert second.identity["endpoint_fingerprint"] != first.identity["endpoint_fingerprint"]
@@ -728,6 +808,10 @@ async def test_bad_envelope_whitelist_and_malformed_ciphertext_handling(tmp_path
 	trace("testing outbound Whitelist rejection, envelope size/hash checks, and malformed ciphertext reject/drop")
 	with RunningServer(app_a, port_a, cert_path, key_path, ca_path), RunningServer(app_b, port_b, cert_path, key_path, ca_path):
 		good = client_a.build_message_envelope(identity_b, url_b, "valid body")
+		assert client_a.build_message_envelope(identity_b, f"{url_b}/", "normalized route")["recipient_route"]["server_url"] == url_b
+		with pytest.raises(EndpointError) as bad_route_exc:
+			client_a.build_message_envelope(identity_b, f"{url_b}/mailbox", "bad recipient route")
+		assert bad_route_exc.value.code == "url_policy_denied"
 		unknown_destination = client_a.build_message_envelope(identity_b, url_c, "wrong destination")
 		async with httpx.AsyncClient(verify=httpx_verify_config(str(ca_path)), timeout=5.0, follow_redirects=False) as http:
 			unknown = await http.post(
@@ -738,6 +822,14 @@ async def test_bad_envelope_whitelist_and_malformed_ciphertext_handling(tmp_path
 			assert unknown.status_code == 400
 			assert unknown.json()["error"]["code"] == "unknown_destination_server"
 			trace("Server A rejected an outbound destination outside its outbound Whitelist")
+			bad_route = dict(good)
+			bad_route["recipient_route"] = dict(good["recipient_route"])
+			bad_route["recipient_route"]["server_url"] = f"{url_b}/mailbox"
+			bad_route_response = await http.post(f"{url_b}/v1/federation/messages", json=bad_route)
+			assert bad_route_response.status_code == 400
+			assert bad_route_response.json()["error"]["code"] == "invalid_envelope"
+			assert app_b.state.endpoint.queue.count_active("bob") == 0
+			trace("Server B rejected a non-origin recipient route before queueing")
 			bad_hash = dict(good)
 			bad_hash["message_id"] = "bad-hash-message"
 			bad_hash["ciphertext_sha256"] = "0" * 64
@@ -828,11 +920,16 @@ def test_protocol_validation_bad_data_matrix(tmp_path: Path, trace: Any) -> None
 		"http://example.com",
 		"ftp://example.com",
 		"https://user:pass@example.com",
+		"https://example.com/path",
+		"https://example.com?query=1",
 		"https://example.com/#fragment",
 		"https://example.com:444",
 	):
 		with pytest.raises(EndpointError):
 			validate_https_url(url, FederationPolicy(allowed_ports={443}, allow_private_networks=True), "outbound")
+	assert normalize_server_url("HTTPS://EXAMPLE.com/") == "https://example.com"
+	assert normalize_server_url("https://EXAMPLE.com:443/") == "https://example.com:443"
+	assert normalize_server_url("https://EXAMPLE.com:8443/") == "https://example.com:8443"
 	trace("invalid federation schemes, credentials, fragments, and disallowed ports were rejected")
 	with pytest.raises(EndpointError):
 		validate_encrypted_envelope([])

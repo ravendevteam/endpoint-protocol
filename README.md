@@ -1,5 +1,5 @@
 <p align="center">
-    <img src=".github/assets/logo.png" alt="Endpoint Protocol" width="180">
+    <img src=".github/assets/logo.png" alt="Endpoint Protocol">
 </p>
 <hr />
 
@@ -21,6 +21,7 @@ The Endpoint Protocol is an OpenPGP-based encrypted messaging protocol for secur
   - [Development Notes](#development-notes)
 - [The Endpoint Protocol](#the-endpoint-protocol)
   - [Protocol Architecture](#protocol-architecture)
+  - [Contact Artifacts](#contact-artifacts)
   - [Message Structure](#message-structure)
   - [Limitations and Non-Goals](#limitations-and-non-goals)
   - [History (Summarized)](#history-summarized)
@@ -251,6 +252,33 @@ It treats the key as the identity, not the name or route. A username, display na
 
 If a route that used to resolve to one fingerprint later resolves to another, the client should not overwrite the old identity. It should treat the new fingerprint as a separate, untrusted identity and let the user decide whether to trust it.
 
+### Contact Artifacts
+
+A signed public identity proves the fingerprint matches the public key and the identity signature verifies against that key. It does not prove that the server returned the key the sender expected for a real-world person. On first contact, a malicious or compromised server could return a different valid identity for the same route. Contact artifacts are a measure against this.
+
+An Endpoint contact reference is route-qualified. The client_ref alone is only the local name part; the usable contact reference is the combination of server_url and client_ref, similar to how email requires both a local part and a domain. A contact artifact contains that route-qualified reference and the expected fingerprint, and may optionally carry the signed public identity object for offline import. It can be shared out of band as plaintext, a URI, or a QR code:
+```
+endpoint:contact?server_url=https%3A%2F%2Fexample.com&client_ref=bob&fingerprint=ep1%3A...
+```
+
+The JSON form is:
+
+```json
+{
+  "kind": "endpoint-contact",
+  "protocol_version": "endpoint-poc-1",
+  "server_url": "https://example.com",
+  "client_ref": "bob",
+  "endpoint_fingerprint": "ep1:...",
+  "metadata": {
+    "display_name": "Bob",
+    "username": "bob"
+  }
+}
+```
+
+When a client imports a contact artifact, it stores the expected fingerprint separately from human trust state and keys the contact by server_url plus client_ref. A later discovery for that exact route must return a signed identity with the same endpoint_fingerprint. If the server returns a different valid identity, the client should reject it as a contact fingerprint mismatch before storing or using it. This provides first-contact substitution protection only when the contact artifact was obtained through a channel not controlled by the queried server.
+
 ### Message Structure
 
 Endpoint messages are JSON objects. Implementations should treat duplicate JSON keys, unsupported value types, malformed routes, oversized metadata, invalid fingerprints, and unsupported protocol versions as invalid input. Values that are signed must be serialized as canonical JSON before signing or verification.
@@ -345,9 +373,11 @@ The protocol is designed to protect message contents and identity authenticity w
 
 It does not provide forward secrecy. If a client's private key is compromised, messages encrypted to that key may be recoverable by whoever has access to the compromised key and stored ciphertext. The protocol depends on clients protecting their private keys and on users treating unexpected fingerprint changes as meaningful security events.
 
-It also does not guarantee deletion. A server can remove acknowledged envelopes from its mailbox, but the protocol cannot prove that every copy was erased from server storage, logs, backups, clients, or other systems. Deletion is an operational and implementation concern, not a cryptographic guarantee.
+It does not guarantee deletion. A server can remove acknowledged envelopes from its mailbox, but the protocol cannot prove that every copy was erased from server storage, logs, backups, clients, or other systems. Deletion is an operational and implementation concern, not a cryptographic guarantee.
 
-Lastly, it cannot protect against a compromised endpoint. If malware, a hostile operating system, or a malicious client has access to plaintext before encryption or after decryption, the protocol cannot keep that plaintext secret. The protocol's security boundary is the honest client holding its own keys and verifying what it receives.
+It also cannot protect against a compromised endpoint. If malware, a hostile operating system, or a malicious client has access to plaintext before encryption or after decryption, the protocol cannot keep that plaintext secret. The protocol's security boundary is the honest client holding its own keys and verifying what it receives.
+
+Lastly, the protocol cannot independently prove that a first-seen route belongs to the real-world person a sender expects. A malicious server could substitute a different valid identity on first contact. Contact artifacts are a simple way to add out-of-band assurance for this case.
 
 ### History (Summarized)
 
