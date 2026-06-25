@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import httpx
 from websockets.asyncio.client import connect
 
+from .contact import normalize_contact, validate_endpoint_fingerprint
 from .crypto import OpenPgpContext, endpoint_fingerprint, verify_detached
 from .errors import EndpointError, require
 from .protocol import (
@@ -27,7 +28,7 @@ from .protocol import (
 	validate_metadata,
 )
 from .storage import ClientState
-from .transport import httpx_verify_config, wss_ssl_context
+from .transport import httpx_verify_config, normalize_server_url, wss_ssl_context
 
 IDENTITY_SIGNATURE_HINT = "Sync system clocks, regenerate the identity or enrollment bundle, and retry."
 
@@ -37,6 +38,7 @@ class DiscoveryResult:
 	identity: dict[str, Any]
 	trust_state: str
 	route_warning: str | None
+	pin_state: str | None = None
 
 
 @dataclass
@@ -67,7 +69,7 @@ class EndpointClient:
 		verify_tls: str | bool = True,
 	):
 		self.client_ref = client_ref
-		self.home_server_url = home_server_url.rstrip("/")
+		self.home_server_url = normalize_server_url(home_server_url)
 		self.auth_token = auth_token
 		self.openpgp = OpenPgpContext(key_store_dir)
 		self.state = ClientState(Path(state_dir))
@@ -112,7 +114,23 @@ class EndpointClient:
 	def trust_state(self, fingerprint: str) -> str:
 		return self.state.get_trust(fingerprint)
 
-	async def discover(self, peer_server_url: str, peer_client_ref: str) -> DiscoveryResult:
+	def import_contact_pin(self, contact: dict[str, Any]) -> dict[str, Any]:
+		contact = self.validate_contact_pin(contact)
+		self.state.remember_contact_pin(contact["server_url"], contact["client_ref"], contact["endpoint_fingerprint"])
+		public_identity = contact.get("public_identity")
+		if public_identity is not None:
+			self.state.remember_identity(public_identity)
+		return contact
+
+	def validate_contact_pin(self, contact: dict[str, Any]) -> dict[str, Any]:
+		contact = normalize_contact(contact)
+		public_identity = contact.get("public_identity")
+		if public_identity is not None:
+			self.verify_identity(public_identity)
+		return contact
+
+	async def discover(self, peer_server_url: str, peer_client_ref: str, expected_fingerprint: str | None = None) -> DiscoveryResult:
+		peer_server_url = normalize_server_url(peer_server_url)
 		body = {"client_ref": self.client_ref, "peer_server_url": peer_server_url, "peer_client_ref": peer_client_ref}
 		async with httpx.AsyncClient(verify=httpx_verify_config(self.verify_tls), timeout=5.0, follow_redirects=False) as client:
 			response = await client.post(
@@ -124,9 +142,19 @@ class EndpointClient:
 			raise EndpointError("discover_failed", "identity discovery failed", response.status_code, response.text)
 		identity = response.json()
 		self.verify_identity(identity)
+		pin_state = None
+		if expected_fingerprint is not None:
+			expected_fingerprint = validate_endpoint_fingerprint(expected_fingerprint)
+			require(
+				identity["endpoint_fingerprint"] == expected_fingerprint,
+				"contact_fingerprint_mismatch",
+				"discovered identity does not match contact fingerprint",
+			)
+			self.state.remember_contact_pin(peer_server_url, peer_client_ref, expected_fingerprint)
+			pin_state = "matched"
 		self.state.remember_identity(identity)
-		route_warning = self.state.remember_route(peer_server_url.rstrip("/"), peer_client_ref, identity["endpoint_fingerprint"])
-		return DiscoveryResult(identity, self.trust_state(identity["endpoint_fingerprint"]), route_warning)
+		route_warning = self.state.remember_route(peer_server_url, peer_client_ref, identity["endpoint_fingerprint"])
+		return DiscoveryResult(identity, self.trust_state(identity["endpoint_fingerprint"]), route_warning, pin_state)
 
 	def verify_identity(self, identity: dict[str, Any]) -> None:
 		validate_identity_envelope(identity)
@@ -172,7 +200,7 @@ class EndpointClient:
 		sender_public_key = self.public_key_armored()
 		sender_fingerprint = endpoint_fingerprint(sender_public_key)
 		sender_route = {"server_url": self.home_server_url, "client_ref": self.client_ref}
-		recipient_route = {"server_url": recipient_server_url.rstrip("/"), "client_ref": recipient_identity["client_ref"]}
+		recipient_route = {"server_url": normalize_server_url(recipient_server_url), "client_ref": recipient_identity["client_ref"]}
 		payload = {
 			"protocol_version": PROTOCOL_VERSION,
 			"message_id": message_id,

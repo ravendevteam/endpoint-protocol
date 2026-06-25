@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -14,12 +15,13 @@ import trustme
 import uvicorn
 
 from endpoint import cli
+from endpoint.contact import contact_from_uri, contact_route_key, contact_to_uri
 from endpoint.config import load_server_config
 from endpoint.credentials import generate_client_token, hash_client_token, validate_client_token_strength, verify_client_token
 from endpoint.errors import EndpointError
-from endpoint.protocol import canonical_json_bytes, parse_json_strict
+from endpoint.protocol import PROTOCOL_VERSION, canonical_json_bytes, parse_json_strict
 from endpoint.server_core import create_app
-from endpoint.transport import httpx_verify_config
+from endpoint.transport import httpx_verify_config, normalize_server_url
 
 
 def test_key_value_parser_accepts_lists_maps_booleans_integers_and_json() -> None:
@@ -94,6 +96,45 @@ def test_endpoint_error_safe_body_includes_hint_without_debug_detail() -> None:
 	}
 	debug = error.safe_body(debug=True)
 	assert debug["error"]["detail"] == "SignatureInvalid: no valid signature"
+
+
+def test_contact_uri_parser_accepts_and_rejects_expected_shapes() -> None:
+	fingerprint = "ep1:" + ("a" * 52)
+	contact = {
+		"kind": "endpoint-contact",
+		"protocol_version": "endpoint-poc-1",
+		"server_url": "https://example.com",
+		"client_ref": "bob",
+		"endpoint_fingerprint": fingerprint,
+		"metadata": {"display_name": "Bob", "username": "bob"},
+	}
+	uri = contact_to_uri(contact)
+	assert uri.startswith("endpoint:contact?")
+	assert contact_from_uri(uri) == contact
+	assert normalize_server_url("HTTPS://EXAMPLE.com/") == "https://example.com"
+	assert normalize_server_url("https://EXAMPLE.com:443/") == "https://example.com:443"
+	assert len({
+		contact_route_key("https://example.com", "bob"),
+		contact_route_key("https://example.com:443", "bob"),
+		contact_route_key("https://example.com:8443", "bob"),
+	}) == 3
+	for bad_uri in (
+		f"https://example.com/contact?server_url=https://example.com&client_ref=bob&fingerprint={fingerprint}",
+		f"endpoint:contact?client_ref=bob&fingerprint={fingerprint}",
+		f"endpoint:contact?server_url=http://example.com&client_ref=bob&fingerprint={fingerprint}",
+		f"endpoint:contact?server_url=https://example.com/path&client_ref=bob&fingerprint={fingerprint}",
+		f"endpoint:contact?server_url=https://example.com?x=1&client_ref=bob&fingerprint={fingerprint}",
+		f"endpoint:contact?server_url=https://example.com/#route&client_ref=bob&fingerprint={fingerprint}",
+		f"endpoint:contact?server_url=https://user:pass@example.com&client_ref=bob&fingerprint={fingerprint}",
+		"endpoint:contact?server_url=https://example.com&client_ref=bob&fingerprint=bad",
+		f"endpoint:contact?server_url=https://example.com&server_url=https://other.example&client_ref=bob&fingerprint={fingerprint}",
+		f"endpoint:contact?server_url=https://example.com&client_ref=bob&fingerprint={fingerprint}#frag",
+		f"endpoint:contact?server_url=https://example.com&client_ref=bad%20ref&fingerprint={fingerprint}",
+		f"endpoint:contact?server_url=https://example.com&client_ref=bob&fingerprint={fingerprint}&display_name=",
+		f"endpoint:contact?server_url=https://example.com&client_ref=bob&fingerprint={fingerprint}&extra=1",
+	):
+		with pytest.raises(EndpointError):
+			contact_from_uri(bad_uri)
 
 
 def test_cli_reports_usage_and_endpoint_errors_safely(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -211,6 +252,24 @@ def test_setup_bundles_do_not_include_private_keys_and_profiles_resolve_paths(tm
 	assert Path(profile["ca_bundle"]) == guest / "ca.pem"
 	assert Path(profile["key_store_dir"]) == guest / "keys"
 	assert Path(profile["state_dir"]) == guest / "state"
+	contact_uri_path = tmp_path / "bob.endpoint-contact"
+	assert cli.main(["contact", "export", f"profile={guest / 'profile.json'}", f"out={contact_uri_path}"]) == 0
+	contact_export = parse_json_strict(capsys.readouterr().out)
+	assert contact_uri_path.read_text(encoding="utf-8") == contact_export["contact_uri"]
+	assert contact_export["contact"]["client_ref"] == "bob"
+	assert contact_export["contact"]["endpoint_fingerprint"] == parse_json_strict((guest / "identity.json").read_text(encoding="utf-8"))["endpoint_fingerprint"]
+	assert cli.main(["contact", "import", f"profile={host / 'clients' / 'alice' / 'profile.json'}", f"uri={contact_export['contact_uri']}"]) == 0
+	contact_import = parse_json_strict(capsys.readouterr().out)
+	assert contact_import["pin_state"] == "pinned"
+	assert contact_import["trust_state"] == "untrusted"
+	assert contact_import["route_key"] == f"{url}|bob"
+	alice_profile = cli._load_client_profile(host / "clients" / "alice" / "profile.json")
+	contact_index = parse_json_strict((host / "clients" / "alice" / "contacts" / "index.json").read_text(encoding="utf-8"))
+	assert contact_index[f"{url}|bob"]["client_ref"] == "bob"
+	assert "path" not in contact_index[f"{url}|bob"]
+	assert cli._contact_path(alice_profile, f"{url}|bob").exists()
+	alice_state_pins = parse_json_strict((host / "clients" / "alice" / "state" / "contact_pins.json").read_text(encoding="utf-8"))
+	assert alice_state_pins[f"{url}|bob"]["endpoint_fingerprint"] == contact_export["contact"]["endpoint_fingerprint"]
 	assert cli.main(["setup", "enroll", f"workspace={host}", f"enrollment={enrollment}"]) == 0
 	enroll_output = parse_json_strict(capsys.readouterr().out)
 	assert enroll_output["client_ref"] == "bob"
@@ -345,6 +404,127 @@ def test_doctor_reports_common_profile_failures(tmp_path: Path, capsys: pytest.C
 	assert checks["key_store_initialized"]["ok"] is False
 
 
+def test_contact_json_import_verifies_embedded_identity_before_persisting(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+	alice_profile, alice_document, _ = write_profile_with_identity(tmp_path, capsys, "alice", "https://alice.example")
+	_, _, bob_identity = write_profile_with_identity(tmp_path, capsys, "bob", "https://bob.example")
+	contact = {
+		"kind": "endpoint-contact",
+		"protocol_version": PROTOCOL_VERSION,
+		"server_url": "https://bob.example",
+		"client_ref": "bob",
+		"endpoint_fingerprint": bob_identity["endpoint_fingerprint"],
+		"metadata": {"username": "bob", "display_name": "Bob"},
+		"public_identity": bob_identity,
+	}
+	contact_path = tmp_path / "bob.contact.json"
+	contact_path.write_bytes(canonical_json_bytes(contact))
+	assert cli.main(["contact", "import", f"profile={alice_profile}", f"contact={contact_path}"]) == 0
+	import_output = parse_json_strict(capsys.readouterr().out)
+	assert import_output["route_key"] == "https://bob.example|bob"
+	assert import_output["pin_state"] == "pinned"
+	assert import_output["trust_state"] == "untrusted"
+	contacts_dir = Path(alice_document["contacts_dir"])
+	state_dir = Path(alice_document["state_dir"])
+	contact_index = parse_json_strict((contacts_dir / "index.json").read_text(encoding="utf-8"))
+	assert contact_index == {
+		"https://bob.example|bob": {
+			"server_url": "https://bob.example",
+			"client_ref": "bob",
+			"endpoint_fingerprint": bob_identity["endpoint_fingerprint"],
+		}
+	}
+	contact_file = cli._contact_path(alice_document, "https://bob.example|bob")
+	pins_file = state_dir / "contact_pins.json"
+	identities_file = state_dir / "identities.json"
+	assert parse_json_strict(contact_file.read_text(encoding="utf-8")) == contact
+	assert parse_json_strict(pins_file.read_text(encoding="utf-8")) == {
+		"https://bob.example|bob": {
+			"server_url": "https://bob.example",
+			"client_ref": "bob",
+			"endpoint_fingerprint": bob_identity["endpoint_fingerprint"],
+		}
+	}
+	assert parse_json_strict(identities_file.read_text(encoding="utf-8")) == {bob_identity["endpoint_fingerprint"]: bob_identity}
+	second_contact = dict(contact)
+	second_contact["server_url"] = "https://bob.example:8443"
+	second_contact_path = tmp_path / "bob-port.contact.json"
+	second_contact_path.write_bytes(canonical_json_bytes(second_contact))
+	assert cli.main(["contact", "import", f"profile={alice_profile}", f"contact={second_contact_path}"]) == 0
+	second_import = parse_json_strict(capsys.readouterr().out)
+	assert second_import["route_key"] == "https://bob.example:8443|bob"
+	third_contact = dict(contact)
+	third_contact["server_url"] = "https://bob-alt.example"
+	third_contact_path = tmp_path / "bob-alt.contact.json"
+	third_contact_path.write_bytes(canonical_json_bytes(third_contact))
+	assert cli.main(["contact", "import", f"profile={alice_profile}", f"contact={third_contact_path}"]) == 0
+	third_import = parse_json_strict(capsys.readouterr().out)
+	assert third_import["route_key"] == "https://bob-alt.example|bob"
+	contact_index = parse_json_strict((contacts_dir / "index.json").read_text(encoding="utf-8"))
+	assert sorted(contact_index) == ["https://bob-alt.example|bob", "https://bob.example:8443|bob", "https://bob.example|bob"]
+	for item in contact_index.values():
+		assert "path" not in item
+	assert cli.main(["contact", "list", f"profile={alice_profile}"]) == 0
+	list_output = parse_json_strict(capsys.readouterr().out)
+	assert [item["route_key"] for item in list_output["contacts"]] == ["https://bob-alt.example|bob", "https://bob.example:8443|bob", "https://bob.example|bob"]
+	assert cli.main(["contact", "show", f"profile={alice_profile}", "client_ref=bob", "server_url=https://bob.example"]) == 0
+	show_output = parse_json_strict(capsys.readouterr().out)
+	assert show_output["route_key"] == "https://bob.example|bob"
+	assert show_output["contact"] == contact
+	assert cli.main(["contact", "show", f"profile={alice_profile}", "client_ref=bob", "server_url=https://bob.example:8443"]) == 0
+	show_port_output = parse_json_strict(capsys.readouterr().out)
+	assert show_port_output["route_key"] == "https://bob.example:8443|bob"
+	assert show_port_output["contact"]["server_url"] == "https://bob.example:8443"
+	tampered_identity = json.loads(json.dumps(bob_identity))
+	tampered_identity["metadata"] = {"username": "mallory"}
+	bad_contact = dict(contact)
+	bad_contact["metadata"] = {"username": "mallory"}
+	bad_contact["public_identity"] = tampered_identity
+	bad_contact_path = tmp_path / "bad-bob.contact.json"
+	bad_out_path = tmp_path / "bad-bob-out.contact.json"
+	bad_contact_path.write_bytes(canonical_json_bytes(bad_contact))
+	contact_before = contact_file.read_bytes()
+	index_before = (contacts_dir / "index.json").read_bytes()
+	pins_before = pins_file.read_bytes()
+	identities_before = identities_file.read_bytes()
+	assert cli.main(["contact", "import", f"profile={alice_profile}", f"contact={bad_contact_path}", f"out={bad_out_path}"]) == 1
+	error = parse_json_strict(capsys.readouterr().err)
+	assert error["error"]["code"] == "invalid_identity_signature"
+	assert contact_file.read_bytes() == contact_before
+	assert (contacts_dir / "index.json").read_bytes() == index_before
+	assert pins_file.read_bytes() == pins_before
+	assert identities_file.read_bytes() == identities_before
+	assert not bad_out_path.exists()
+	rollback_contact = dict(contact)
+	rollback_contact["server_url"] = "https://rollback.example"
+	rollback_route_key = "https://rollback.example|bob"
+	rollback_contact_path = tmp_path / "rollback.contact.json"
+	rollback_out_path = tmp_path / "rollback-out.contact.json"
+	rollback_contact_path.write_bytes(canonical_json_bytes(rollback_contact))
+	rollback_stored_path = cli._contact_path(alice_document, rollback_route_key)
+	index_before = (contacts_dir / "index.json").read_bytes()
+	pins_before = pins_file.read_bytes()
+	identities_before = identities_file.read_bytes()
+
+	def fail_import_contact_pin(self: Any, value: dict[str, Any]) -> dict[str, Any]:
+		raise EndpointError("simulated_state_failure", "simulated state failure")
+
+	monkeypatch.setattr(cli.EndpointClient, "import_contact_pin", fail_import_contact_pin)
+	assert cli.main(["contact", "import", f"profile={alice_profile}", f"contact={rollback_contact_path}", f"out={rollback_out_path}"]) == 1
+	rollback_error = parse_json_strict(capsys.readouterr().err)
+	assert rollback_error["error"]["code"] == "simulated_state_failure"
+	assert not rollback_stored_path.exists()
+	assert (contacts_dir / "index.json").read_bytes() == index_before
+	assert pins_file.read_bytes() == pins_before
+	assert identities_file.read_bytes() == identities_before
+	assert not rollback_out_path.exists()
+	malicious_index = parse_json_strict(index_before.decode("utf-8"))
+	malicious_index["https://bob.example|bob"]["path"] = "../profile.json"
+	(contacts_dir / "index.json").write_bytes(canonical_json_bytes(malicious_index))
+	assert cli.main(["contact", "show", f"profile={alice_profile}", "client_ref=bob", "server_url=https://bob.example"]) == 1
+	corrupt_error = parse_json_strict(capsys.readouterr().err)
+	assert corrupt_error["error"]["code"] == "invalid_contact"
+
+
 def test_cli_driven_same_server_exchange_drains_queue_without_plaintext(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
 	cert_path, key_path, ca_path = make_tls(tmp_path)
 	port = free_port()
@@ -460,13 +640,39 @@ def test_setup_profile_driven_same_server_exchange_round_trip(tmp_path: Path, ca
 	capsys.readouterr()
 	assert cli.main(["setup", "enroll", f"workspace={host}", f"enrollment={enrollment}"]) == 0
 	capsys.readouterr()
+	assert cli.main(["contact", "export", f"profile={guest / 'profile.json'}"]) == 0
+	bob_contact = parse_json_strict(capsys.readouterr().out)
+	assert cli.main(["contact", "import", f"profile={host / 'clients' / 'alice' / 'profile.json'}", f"uri={bob_contact['contact_uri']}"]) == 0
+	import_output = parse_json_strict(capsys.readouterr().out)
+	assert import_output["pin_state"] == "pinned"
+	assert import_output["trust_state"] == "untrusted"
+	assert import_output["route_key"] == f"{url}|bob"
 	app = create_app(load_server_config(host / "server.json"))
 	body_ab = "profile-driven hello bob"
 	body_ba = "profile-driven hello alice"
 	with RunningServer(app, port, host / "tls" / "server.pem", host / "tls" / "server.key", host / "tls" / "ca.pem"):
-		assert cli.main(["send", f"profile={host / 'clients' / 'alice' / 'profile.json'}", "to=bob", f"body={body_ab}"]) == 0
+		assert cli.main(["discover", f"profile={host / 'clients' / 'alice' / 'profile.json'}", "peer_client_ref=bob"]) == 1
+		discover_route_required = parse_json_strict(capsys.readouterr().err)
+		assert discover_route_required["error"]["code"] == "contact_route_required"
+		assert cli.main(["discover", f"profile={host / 'clients' / 'alice' / 'profile.json'}", "peer_client_ref=bob", f"peer_server_url={url}"]) == 0
+		discover_bob = parse_json_strict(capsys.readouterr().out)
+		assert discover_bob["pin_state"] == "matched"
+		assert cli.main(["discover", f"profile={guest / 'profile.json'}", "peer_client_ref=alice", f"peer_server_url={url}"]) == 0
+		discover_alice = parse_json_strict(capsys.readouterr().out)
+		assert discover_alice["pin_state"] is None
+		assert cli.main([
+			"send",
+			f"profile={host / 'clients' / 'alice' / 'profile.json'}",
+			"to=bob",
+			"body=route required should not queue",
+		]) == 1
+		route_required = parse_json_strict(capsys.readouterr().err)
+		assert route_required["error"]["code"] == "contact_route_required"
+		assert app.state.endpoint.queue.count_active("bob") == 0
+		assert cli.main(["send", f"profile={host / 'clients' / 'alice' / 'profile.json'}", "to=bob", f"recipient_server_url={url}", f"body={body_ab}"]) == 0
 		send_ab = parse_json_strict(capsys.readouterr().out)
 		assert isinstance(send_ab["message_id"], str)
+		assert send_ab["recipient_pin_state"] == "matched"
 		assert app.state.endpoint.queue.count_active("bob") == 1
 		assert cli.main(["receive", f"profile={guest / 'profile.json'}", "limit=1", "timeout=5"]) == 0
 		receive_b = parse_json_strict(capsys.readouterr().out)
@@ -480,6 +686,16 @@ def test_setup_profile_driven_same_server_exchange_round_trip(tmp_path: Path, ca
 		receive_a = parse_json_strict(capsys.readouterr().out)
 		assert [message["body"] for message in receive_a["messages"]] == [body_ba]
 		assert app.state.endpoint.queue.count_active("alice") == 0
+		alice_identity = parse_json_strict((host / "clients" / "alice" / "identity.json").read_text(encoding="utf-8"))
+		bad_contact = dict(bob_contact["contact"])
+		bad_contact["endpoint_fingerprint"] = alice_identity["endpoint_fingerprint"]
+		bad_uri = contact_to_uri(bad_contact)
+		assert cli.main(["contact", "import", f"profile={host / 'clients' / 'alice' / 'profile.json'}", f"uri={bad_uri}"]) == 0
+		capsys.readouterr()
+		assert cli.main(["send", f"profile={host / 'clients' / 'alice' / 'profile.json'}", "to=bob", f"recipient_server_url={url}", "body=should fail before queue"]) == 1
+		mismatch = parse_json_strict(capsys.readouterr().err)
+		assert mismatch["error"]["code"] == "contact_fingerprint_mismatch"
+		assert app.state.endpoint.queue.count_active("bob") == 0
 	assert_plaintext_absent(host / "server-state", body_ab)
 	assert_plaintext_absent(host / "server-state", body_ba)
 
@@ -488,6 +704,49 @@ def free_port() -> int:
 	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
 		sock.bind(("127.0.0.1", 0))
 		return sock.getsockname()[1]
+
+
+def write_profile_with_identity(tmp_path: Path, capsys: pytest.CaptureFixture[str], client_ref: str, server_url: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+	if not (tmp_path / "ca.pem").exists():
+		make_tls(tmp_path)
+	root = tmp_path / client_ref
+	profile_path = root / "profile.json"
+	identity_path = root / "identity.json"
+	state_dir = root / "state"
+	key_store_dir = root / "openpgp"
+	contacts_dir = root / "contacts"
+	token = generate_client_token()
+	assert cli.main([
+		"identity",
+		"export",
+		f"client_ref={client_ref}",
+		f"home_server_url={server_url}",
+		f"auth_token={token}",
+		f"state_dir={state_dir}",
+		f"key_store_dir={key_store_dir}",
+		f"ca_bundle={tmp_path / 'ca.pem'}",
+		f"name={client_ref}",
+		f"email={client_ref}@endpoint.test",
+		f"metadata_json={{\"username\":\"{client_ref}\"}}",
+		f"out={identity_path}",
+	]) == 0
+	capsys.readouterr()
+	profile = {
+		"protocol_version": PROTOCOL_VERSION,
+		"kind": "endpoint-client-profile",
+		"client_ref": client_ref,
+		"home_server_url": server_url,
+		"auth_token": token,
+		"state_dir": str(state_dir),
+		"key_store_dir": str(key_store_dir),
+		"ca_bundle": str(tmp_path / "ca.pem"),
+		"identity_path": str(identity_path),
+		"contacts_dir": str(contacts_dir),
+		"metadata": {"username": client_ref},
+	}
+	profile_path.parent.mkdir(parents=True, exist_ok=True)
+	profile_path.write_bytes(canonical_json_bytes(profile))
+	return profile_path, profile, parse_json_strict(identity_path.read_text(encoding="utf-8"))
 
 
 def make_tls(tmp_path: Path) -> tuple[Path, Path, Path]:

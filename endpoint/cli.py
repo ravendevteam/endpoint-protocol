@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import shutil
 import ssl
@@ -16,6 +17,7 @@ import httpx
 import uvicorn
 
 from .client_core import EndpointClient, ReceivedMessage
+from .contact import contact_from_identity, contact_from_uri, contact_route_key, contact_to_uri, normalize_contact, validate_endpoint_fingerprint
 from .config import load_server_config
 from .credentials import generate_client_token, hash_client_token, validate_client_token_hash
 from .crypto import endpoint_fingerprint, verify_detached
@@ -74,6 +76,13 @@ def build_parser() -> argparse.ArgumentParser:
 	identity_sub = identity.add_subparsers(dest="identity_command", required=True)
 	_add_leaf(identity_sub, "export", _cmd_identity_export)
 
+	contact = subparsers.add_parser("contact")
+	contact_sub = contact.add_subparsers(dest="contact_command", required=True)
+	_add_leaf(contact_sub, "export", _cmd_contact_export)
+	_add_leaf(contact_sub, "import", _cmd_contact_import)
+	_add_leaf(contact_sub, "list", _cmd_contact_list)
+	_add_leaf(contact_sub, "show", _cmd_contact_show)
+
 	server = subparsers.add_parser("server")
 	server_sub = server.add_subparsers(dest="server_command", required=True)
 	_add_leaf(server_sub, "init-config", _cmd_server_init_config)
@@ -124,6 +133,77 @@ def _cmd_identity_export(tokens: list[str]) -> int:
 	identity = client.export_identity(metadata)
 	_write_json_file_if_requested(values.get("out"), identity)
 	_write_json(identity)
+	return 0
+
+
+def _cmd_contact_export(tokens: list[str]) -> int:
+	values = _parse_key_values(tokens, scalar_keys={"profile", "out"}, required_scalars={"profile"})
+	profile = _load_client_profile(Path(values["profile"]))
+	identity = _load_json_object(profile["identity_path"], "profile identity")
+	_verify_identity_signature(identity)
+	contact = contact_from_identity(profile["home_server_url"], identity)
+	contact_uri = contact_to_uri(contact)
+	if "out" in values:
+		target = Path(values["out"])
+		target.parent.mkdir(parents=True, exist_ok=True)
+		target.write_text(contact_uri, encoding="utf-8")
+	_write_json({"contact_uri": contact_uri, "contact": contact})
+	return 0
+
+
+def _cmd_contact_import(tokens: list[str]) -> int:
+	values = _parse_key_values(tokens, scalar_keys={"profile", "uri", "contact", "out"}, required_scalars={"profile"})
+	require(("uri" in values) != ("contact" in values), "invalid_contact", "provide exactly one of uri or contact")
+	profile = _load_client_profile(Path(values["profile"]))
+	if "uri" in values:
+		contact = contact_from_uri(values["uri"])
+	else:
+		contact = normalize_contact(_load_json_object(values["contact"], "contact"))
+	client = _client_from_values(_client_values_from_profile(profile))
+	contact, route_key = _remember_contact(profile, client, contact)
+	if "out" in values:
+		_write_json_file(values["out"], contact)
+	_write_json({
+		"status": "ok",
+		"client_ref": contact["client_ref"],
+		"server_url": contact["server_url"],
+		"endpoint_fingerprint": contact["endpoint_fingerprint"],
+		"route_key": route_key,
+		"pin_state": "pinned",
+		"trust_state": client.trust_state(contact["endpoint_fingerprint"]),
+	})
+	return 0
+
+
+def _cmd_contact_list(tokens: list[str]) -> int:
+	values = _parse_key_values(tokens, scalar_keys={"profile"}, required_scalars={"profile"})
+	profile = _load_client_profile(Path(values["profile"]))
+	client = _client_from_values(_client_values_from_profile(profile))
+	contacts = []
+	for route_key, item in sorted(_load_contact_index(profile).items()):
+		contacts.append({
+			"route_key": route_key,
+			"server_url": item["server_url"],
+			"client_ref": item["client_ref"],
+			"endpoint_fingerprint": item["endpoint_fingerprint"],
+			"trust_state": client.trust_state(item["endpoint_fingerprint"]),
+		})
+	_write_json({"contacts": contacts})
+	return 0
+
+
+def _cmd_contact_show(tokens: list[str]) -> int:
+	values = _parse_key_values(tokens, scalar_keys={"profile", "server_url", "client_ref"}, required_scalars={"profile", "server_url", "client_ref"})
+	profile = _load_client_profile(Path(values["profile"]))
+	server_url = _normalize_cli_url(values["server_url"], "server_url")
+	contact = _load_contact_by_route(profile, server_url, values["client_ref"])
+	require(contact is not None, "contact_not_found", "contact was not found for this route")
+	client = _client_from_values(_client_values_from_profile(profile))
+	_write_json({
+		"route_key": contact_route_key(server_url, values["client_ref"]),
+		"contact": contact,
+		"trust_state": client.trust_state(contact["endpoint_fingerprint"]),
+	})
 	return 0
 
 
@@ -449,7 +529,7 @@ def _cmd_setup_run(tokens: list[str]) -> int:
 def _cmd_discover(tokens: list[str]) -> int:
 	values = _parse_key_values(
 		tokens,
-		scalar_keys=_CLIENT_KEYS | {"profile", "peer_server_url", "peer_client_ref", "identity_out"},
+		scalar_keys=_CLIENT_KEYS | {"profile", "peer_server_url", "peer_client_ref", "expected_fingerprint", "identity_out"},
 	)
 	if "profile" in values:
 		profile = _load_client_profile(Path(values["profile"]))
@@ -458,14 +538,33 @@ def _cmd_discover(tokens: list[str]) -> int:
 		profile = None
 		client_values = values
 		_require_arguments(client_values, {"client_ref", "home_server_url", "auth_token", "state_dir", "key_store_dir", "peer_server_url", "peer_client_ref"})
-	_require_arguments(values, {"peer_server_url", "peer_client_ref"})
-	result = asyncio.run(_client_from_values(client_values).discover(values["peer_server_url"], values["peer_client_ref"]))
+	_require_arguments(values, {"peer_client_ref"})
+	contact = None
+	peer_server_url = values.get("peer_server_url")
+	expected_fingerprint = values.get("expected_fingerprint")
 	if profile is not None:
-		_write_contact(profile, values["peer_client_ref"], result.identity)
+		if peer_server_url is not None:
+			peer_server_url = _normalize_cli_url(peer_server_url, "peer_server_url")
+			contact = _load_contact_by_route(profile, peer_server_url, values["peer_client_ref"])
+			if contact is not None:
+				if expected_fingerprint is not None:
+					require(expected_fingerprint == contact["endpoint_fingerprint"], "contact_fingerprint_mismatch", "expected fingerprint does not match contact pin")
+				expected_fingerprint = contact["endpoint_fingerprint"]
+		else:
+			require(not _contacts_for_client_ref(profile, values["peer_client_ref"]), "contact_route_required", "server_url is required for imported contacts")
+			peer_server_url = profile["home_server_url"]
+	require(isinstance(peer_server_url, str) and peer_server_url != "", "invalid_config", "peer_server_url is required")
+	client = _client_from_values(client_values)
+	result = asyncio.run(client.discover(peer_server_url, values["peer_client_ref"], expected_fingerprint))
+	if profile is not None:
+		_write_contact(profile, peer_server_url, values["peer_client_ref"], result.identity)
+		if result.pin_state == "matched":
+			_remember_contact(profile, client, contact_from_identity(peer_server_url, result.identity))
 	_write_json_file_if_requested(values.get("identity_out"), result.identity)
 	_write_json({
 		"identity": result.identity,
 		"route_warning": result.route_warning,
+		"pin_state": result.pin_state,
 		"trust_state": result.trust_state,
 	})
 	return 0
@@ -483,15 +582,27 @@ def _cmd_send(tokens: list[str]) -> int:
 		client_values = _client_values_from_profile(profile)
 		client = _client_from_values(client_values)
 		sender_metadata = _metadata_from_values(values) if "metadata_json" in values else profile.get("metadata")
+		recipient_pin_state = None
 		if "recipient_identity" in values:
 			recipient_identity = _load_json_object(values["recipient_identity"], "recipient_identity")
+			recipient_server_url = values.get("recipient_server_url", profile["home_server_url"])
 		else:
 			_require_arguments(values, {"to"})
-			recipient_server_url = values.get("recipient_server_url", profile["home_server_url"])
-			discovery = asyncio.run(client.discover(recipient_server_url, values["to"]))
+			contact = None
+			recipient_server_url = values.get("recipient_server_url")
+			if recipient_server_url is not None:
+				recipient_server_url = _normalize_cli_url(recipient_server_url, "recipient_server_url")
+				contact = _load_contact_by_route(profile, recipient_server_url, values["to"])
+			else:
+				require(not _contacts_for_client_ref(profile, values["to"]), "contact_route_required", "recipient_server_url is required for imported contacts")
+				recipient_server_url = profile["home_server_url"]
+			if contact is not None:
+				discovery = asyncio.run(client.discover(contact["server_url"], contact["client_ref"], contact["endpoint_fingerprint"]))
+				recipient_pin_state = discovery.pin_state
+			else:
+				discovery = asyncio.run(client.discover(recipient_server_url, values["to"]))
 			recipient_identity = discovery.identity
-			_write_contact(profile, values["to"], recipient_identity)
-		recipient_server_url = values.get("recipient_server_url", profile["home_server_url"])
+			_write_contact(profile, recipient_server_url, values["to"], recipient_identity)
 	else:
 		_require_arguments(values, {"client_ref", "home_server_url", "auth_token", "state_dir", "key_store_dir", "recipient_identity", "recipient_server_url"})
 		client = _client_from_values(values)
@@ -499,6 +610,7 @@ def _cmd_send(tokens: list[str]) -> int:
 		sender_metadata = _metadata_from_values(values)
 		recipient_identity = _load_json_object(values["recipient_identity"], "recipient_identity")
 		recipient_server_url = values["recipient_server_url"]
+		recipient_pin_state = None
 	client.require_existing_identity()
 	result = asyncio.run(client.send_message(
 		recipient_identity,
@@ -507,10 +619,13 @@ def _cmd_send(tokens: list[str]) -> int:
 		sender_metadata,
 		values.get("message_id"),
 	))
-	_write_json({
+	output = {
 		"message_id": result.message_id,
 		"recipient_trust_state": result.recipient_trust_state,
-	})
+	}
+	if recipient_pin_state is not None:
+		output["recipient_pin_state"] = recipient_pin_state
+	_write_json(output)
 	return 0
 
 
@@ -912,10 +1027,112 @@ def _client_values_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
 	}
 
 
-def _write_contact(profile: dict[str, Any], client_ref: str, identity: dict[str, Any]) -> None:
+def _write_contact(profile: dict[str, Any], server_url: str, client_ref: str, identity: dict[str, Any]) -> None:
 	contacts_dir = Path(profile["contacts_dir"])
 	contacts_dir.mkdir(parents=True, exist_ok=True)
-	_write_json_file(contacts_dir / f"{_safe_file_stem(client_ref)}.identity.json", identity)
+	route_key = contact_route_key(server_url, client_ref)
+	_write_json_file(contacts_dir / f"identity-{_route_key_hash(route_key)}.json", identity)
+
+
+def _contact_index_path(profile: dict[str, Any]) -> Path:
+	return Path(profile["contacts_dir"]) / "index.json"
+
+
+def _route_key_hash(route_key: str) -> str:
+	return hashlib.sha256(route_key.encode("utf-8")).hexdigest()
+
+
+def _contact_path(profile: dict[str, Any], route_key: str) -> Path:
+	return Path(profile["contacts_dir"]) / f"contact-{_route_key_hash(route_key)}.json"
+
+
+def _load_contact_index(profile: dict[str, Any]) -> dict[str, dict[str, str]]:
+	path = _contact_index_path(profile)
+	if not path.exists():
+		return {}
+	value = parse_json_strict(path.read_text(encoding="utf-8"))
+	require(isinstance(value, dict), "invalid_contact", "contact index must be a JSON object")
+	index: dict[str, dict[str, str]] = {}
+	for route_key, item in value.items():
+		require(isinstance(route_key, str) and isinstance(item, dict), "invalid_contact", "contact index entry is invalid")
+		require(set(item) == {"server_url", "client_ref", "endpoint_fingerprint"}, "invalid_contact", "contact index entry keys are invalid")
+		server_url = _require_index_string(item, "server_url")
+		client_ref = _require_index_string(item, "client_ref")
+		endpoint_fingerprint = validate_endpoint_fingerprint(_require_index_string(item, "endpoint_fingerprint"))
+		require(route_key == contact_route_key(server_url, client_ref), "invalid_contact", "contact index route key mismatch")
+		index[route_key] = {
+			"server_url": normalize_server_url(server_url),
+			"client_ref": client_ref,
+			"endpoint_fingerprint": endpoint_fingerprint,
+		}
+	return index
+
+
+def _save_contact_index(profile: dict[str, Any], index: dict[str, dict[str, str]]) -> None:
+	_write_json_file(_contact_index_path(profile), index)
+
+
+def _load_contact_by_route(profile: dict[str, Any] | None, server_url: str, client_ref: str) -> dict[str, Any] | None:
+	if profile is None:
+		return None
+	route_key = contact_route_key(server_url, client_ref)
+	item = _load_contact_index(profile).get(route_key)
+	if item is None:
+		return None
+	path = _contact_path(profile, route_key)
+	contact = normalize_contact(_load_json_object(str(path), "contact"))
+	require(contact_route_key(contact["server_url"], contact["client_ref"]) == route_key, "invalid_contact", "stored contact route mismatch")
+	require(contact["endpoint_fingerprint"] == item["endpoint_fingerprint"], "invalid_contact", "stored contact fingerprint mismatch")
+	return contact
+
+
+def _contacts_for_client_ref(profile: dict[str, Any], client_ref: str) -> list[dict[str, str]]:
+	return [item for item in _load_contact_index(profile).values() if item["client_ref"] == client_ref]
+
+
+def _remember_contact(profile: dict[str, Any], client: EndpointClient, contact: dict[str, Any]) -> tuple[dict[str, Any], str]:
+	contact = client.validate_contact_pin(contact)
+	route_key = contact_route_key(contact["server_url"], contact["client_ref"])
+	contacts_dir = Path(profile["contacts_dir"])
+	contacts_dir.mkdir(parents=True, exist_ok=True)
+	contact_path = _contact_path(profile, route_key)
+	old_contact_bytes = contact_path.read_bytes() if contact_path.exists() else None
+	_write_json_file(contact_path, contact)
+	index = _load_contact_index(profile)
+	old_index = dict(index)
+	index[route_key] = {
+		"server_url": contact["server_url"],
+		"client_ref": contact["client_ref"],
+		"endpoint_fingerprint": contact["endpoint_fingerprint"],
+	}
+	_save_contact_index(profile, index)
+	try:
+		contact = client.import_contact_pin(contact)
+	except Exception:
+		_rollback_contact_import(profile, contact_path, old_contact_bytes, old_index)
+		raise
+	return contact, route_key
+
+
+def _rollback_contact_import(profile: dict[str, Any], contact_path: Path, old_contact_bytes: bytes | None, old_index: dict[str, dict[str, str]]) -> None:
+	try:
+		if old_contact_bytes is None:
+			contact_path.unlink(missing_ok=True)
+		else:
+			contact_path.write_bytes(old_contact_bytes)
+		index_path = _contact_index_path(profile)
+		if old_index:
+			_save_contact_index(profile, old_index)
+		else:
+			index_path.unlink(missing_ok=True)
+	except Exception:
+		pass
+
+
+def _require_index_string(item: dict[str, Any], key: str) -> str:
+	value = item.get(key)
+	require(isinstance(value, str) and value != "", "invalid_contact", f"contact index {key} is invalid")
+	return value
 
 
 def _load_workspace(workspace: Path) -> dict[str, Any]:

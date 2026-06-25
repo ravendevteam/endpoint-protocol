@@ -9,7 +9,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .errors import require
 from .protocol import canonical_json_bytes, now_iso
+from .transport import normalize_server_url
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -60,7 +62,7 @@ class ClientState:
 
 	def remember_route(self, server_url: str, client_ref: str, fingerprint: str) -> str | None:
 		routes = load_json(self._path("routes.json"), {})
-		key = f"{server_url}|{client_ref}"
+		key = _route_key(server_url, client_ref)
 		seen = routes.setdefault(key, [])
 		warning = None
 		if seen and fingerprint not in seen:
@@ -69,6 +71,20 @@ class ClientState:
 			seen.append(fingerprint)
 		save_json(self._path("routes.json"), routes)
 		return warning
+
+	def remember_contact_pin(self, server_url: str, client_ref: str, fingerprint: str) -> None:
+		pins = load_json(self._path("contact_pins.json"), {})
+		normalized_server_url = normalize_server_url(server_url)
+		key = _route_key(normalized_server_url, client_ref)
+		pins[key] = {"server_url": normalized_server_url, "client_ref": client_ref, "endpoint_fingerprint": fingerprint}
+		save_json(self._path("contact_pins.json"), pins)
+
+	def contact_pin(self, server_url: str, client_ref: str) -> str | None:
+		pins = load_json(self._path("contact_pins.json"), {})
+		pin = pins.get(_route_key(server_url, client_ref))
+		if isinstance(pin, dict) and isinstance(pin.get("endpoint_fingerprint"), str):
+			return pin["endpoint_fingerprint"]
+		return None
 
 	def has_processed(self, message_id: str) -> bool:
 		seen = load_json(self._path("processed_messages.json"), [])
@@ -79,6 +95,11 @@ class ClientState:
 		if message_id not in seen:
 			seen.append(message_id)
 		save_json(self._path("processed_messages.json"), seen)
+
+
+def _route_key(server_url: str, client_ref: str) -> str:
+	require(isinstance(client_ref, str) and client_ref != "", "invalid_envelope", "route.client_ref is required")
+	return f"{normalize_server_url(server_url)}|{client_ref}"
 
 
 @dataclass

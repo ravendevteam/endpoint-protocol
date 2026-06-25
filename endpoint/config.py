@@ -49,7 +49,7 @@ def load_server_config(path: Path) -> ServerConfig:
 	require(data["protocol_version"] == PROTOCOL_VERSION, "invalid_config", "server config protocol version is unsupported")
 	server_url = _require_string(data["server_url"], "server_url")
 	try:
-		normalize_server_url(server_url)
+		server_url = normalize_server_url(server_url)
 	except EndpointError as exc:
 		raise EndpointError("invalid_config", "server_url is invalid", detail=exc.code) from exc
 	state_dir = Path(_require_string(data["state_dir"], "state_dir"))
@@ -147,7 +147,11 @@ def _require_string_set(value: Any, field: str) -> set[str]:
 	require(isinstance(value, list), "invalid_config", f"{field} must be a list")
 	out: set[str] = set()
 	for item in value:
-		out.add(_require_string(item, field))
+		url = _require_string(item, field)
+		try:
+			out.add(normalize_server_url(url))
+		except EndpointError as exc:
+			raise EndpointError("invalid_config", f"{field} contains an invalid server URL", detail=exc.code) from exc
 	return out
 
 
