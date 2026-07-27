@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import httpx
 import uvicorn
 
-from .client_core import EndpointClient, ReceivedMessage
+from .client_core import EndpointClient, RecipientSpec, ReceivedMessage
 from .contact import contact_from_identity, contact_from_uri, contact_route_key, contact_to_uri, normalize_contact, validate_endpoint_fingerprint
 from .config import load_server_config
 from .credentials import generate_client_token, hash_client_token, validate_client_token_hash
@@ -100,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
 	_add_leaf(subparsers, "discover", _cmd_discover)
 	_add_leaf(subparsers, "send", _cmd_send)
 	_add_leaf(subparsers, "receive", _cmd_receive)
+	_add_leaf(subparsers, "retry", _cmd_retry)
 	_add_leaf(subparsers, "doctor", _cmd_doctor)
 	return parser
 
@@ -572,10 +573,38 @@ def _cmd_discover(tokens: list[str]) -> int:
 
 def _cmd_send(tokens: list[str]) -> int:
 	values = _parse_key_values(
-		tokens,
-		scalar_keys=_CLIENT_KEYS | {"profile", "to", "recipient_identity", "recipient_server_url", "body", "metadata_json", "message_id"},
+		 tokens,
+		scalar_keys=_CLIENT_KEYS | {"profile", "to", "recipient_identity", "recipient_server_url", "recipients_json", "body", "metadata_json", "message_id"},
 	)
 	_require_arguments(values, {"body"})
+	if "recipients_json" in values:
+		if "profile" in values:
+			profile = _load_client_profile(Path(values["profile"]))
+			_require_profile_clock_sync(profile)
+			client = _client_from_values(_client_values_from_profile(profile))
+			sender_metadata = _metadata_from_values(values) if "metadata_json" in values else profile.get("metadata")
+		else:
+			_require_arguments(values, {"client_ref", "home_server_url", "auth_token", "state_dir", "key_store_dir"})
+			client = _client_from_values(values)
+			sender_metadata = _metadata_from_values(values)
+		client.require_existing_identity()
+		recipients = _load_recipient_specs(Path(values["recipients_json"]))
+		result = asyncio.run(client.send_message_fanout(recipients, values["body"], sender_metadata))
+		_write_json({
+			"content_id": result.content_id,
+			"deliveries": [
+				{
+					"message_id": delivery.message_id,
+					"recipient_route": delivery.recipient_route,
+					"recipient_role": delivery.recipient_role,
+					"recipient_trust_state": delivery.recipient_trust_state,
+					"status": delivery.status,
+					"error_code": delivery.error_code,
+				}
+				for delivery in result.deliveries
+			],
+		})
+		return 0
 	if "profile" in values:
 		profile = _load_client_profile(Path(values["profile"]))
 		_require_profile_clock_sync(profile)
@@ -621,6 +650,7 @@ def _cmd_send(tokens: list[str]) -> int:
 	))
 	output = {
 		"message_id": result.message_id,
+		"content_id": result.content_id,
 		"recipient_trust_state": result.recipient_trust_state,
 	}
 	if recipient_pin_state is not None:
@@ -648,6 +678,39 @@ def _cmd_receive(tokens: list[str]) -> int:
 		timeout=_parse_float(values.get("timeout", "5"), "timeout", 0.0),
 	))
 	_write_json({"messages": [_message_to_dict(message) for message in messages]})
+	return 0
+
+
+def _cmd_retry(tokens: list[str]) -> int:
+	values = _parse_key_values(tokens, scalar_keys=_CLIENT_KEYS | {"profile", "limit"})
+	if "profile" in values:
+		profile = _load_client_profile(Path(values["profile"]))
+		_require_profile_clock_sync(profile)
+		client_values = _client_values_from_profile(profile)
+	else:
+		_require_arguments(values, {"client_ref", "home_server_url", "auth_token", "state_dir", "key_store_dir"})
+		client_values = values
+	client = _client_from_values(client_values)
+	client.require_existing_identity()
+	result = asyncio.run(client.retry_outbox(_parse_int(values.get("limit", "50"), "limit", 1, 1000)))
+	if result is None:
+		_write_json({"status": "empty", "deliveries": []})
+		return 0
+	_write_json({
+		"status": "retried",
+		"content_id": result.content_id,
+		"deliveries": [
+			{
+				"message_id": delivery.message_id,
+				"recipient_route": delivery.recipient_route,
+				"recipient_role": delivery.recipient_role,
+				"recipient_trust_state": delivery.recipient_trust_state,
+				"status": delivery.status,
+				"error_code": delivery.error_code,
+			}
+			for delivery in result.deliveries
+		],
+	})
 	return 0
 
 
@@ -802,6 +865,23 @@ def _load_json_object(path: str, field: str) -> dict[str, Any]:
 	return value
 
 
+def _load_recipient_specs(path: Path) -> list[RecipientSpec]:
+	value = _load_json_object(path, "recipients_json")
+	require(set(value).issubset({"to", "cc", "bcc"}), "invalid_config", "recipients_json contains an unsupported role")
+	specs: list[RecipientSpec] = []
+	for role in ("to", "cc", "bcc"):
+		items = value.get(role, [])
+		require(isinstance(items, list), "invalid_config", f"recipients_json.{role} must be an array")
+		for item in items:
+			require(isinstance(item, dict), "invalid_config", f"recipients_json.{role} entries must be objects")
+			require(set(item) == {"server_url", "identity"}, "invalid_config", f"recipients_json.{role} entry fields are invalid")
+			require(isinstance(item["server_url"], str) and item["server_url"], "invalid_config", "recipient server_url is required")
+			require(isinstance(item["identity"], dict), "invalid_config", "recipient identity must be an object")
+			specs.append(RecipientSpec(item["identity"], item["server_url"], role))
+	require(specs, "invalid_config", "recipients_json must contain at least one recipient")
+	return specs
+
+
 def _write_json_file_if_requested(path: str | None, value: Any) -> None:
 	if path is not None:
 		_write_json_file(path, value)
@@ -822,8 +902,13 @@ def _write_json(value: Any, stream: Any | None = None) -> None:
 def _message_to_dict(message: ReceivedMessage) -> dict[str, Any]:
 	return {
 		"body": message.body,
+		"content": message.content,
+		"content_id": message.content_id,
+		"content_type": message.content_type,
+		"delivery_role": message.delivery_role,
 		"message_id": message.message_id,
 		"raw_payload": message.raw_payload,
+		"raw_delivery_claim": message.raw_delivery_claim,
 		"sender_fingerprint": message.sender_fingerprint,
 		"sender_metadata": message.sender_metadata,
 		"sender_trust_state": message.sender_trust_state,
@@ -998,7 +1083,7 @@ def _client_profile_document(
 
 def _load_client_profile(path: Path) -> dict[str, Any]:
 	profile = _load_json_object(str(path), "profile")
-	require(profile.get("protocol_version") == PROTOCOL_VERSION, "invalid_config", "profile protocol version is unsupported")
+	require(profile.get("protocol_version") in {"endpoint-poc-1", PROTOCOL_VERSION}, "invalid_config", "profile protocol version is unsupported")
 	require(profile.get("kind") == "endpoint-client-profile", "invalid_config", "profile kind is invalid")
 	base = path.parent
 	out = dict(profile)

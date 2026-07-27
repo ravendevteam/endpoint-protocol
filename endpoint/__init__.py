@@ -1,1 +1,1 @@
-PROTOCOL_VERSION = "endpoint-poc-1"
+PROTOCOL_VERSION = "endpoint-poc-2"

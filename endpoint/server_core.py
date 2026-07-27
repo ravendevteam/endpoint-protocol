@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,13 +18,25 @@ from .protocol import (
 	canonical_json_bytes,
 	identity_signature_payload,
 	now_iso,
-	validate_encrypted_envelope,
+	delivery_envelope_uses_content_reference,
+	validate_content_object,
+	validate_delivery_envelope,
 	validate_identity_envelope,
 )
-from .storage import MessageQueue, ReplayStore, StructuredLog
+from .storage import ContentStore, MessageQueue, ReplayStore, StructuredLog
 from .transport import FederationPolicy, httpx_verify_config, normalize_server_url, validate_https_url
 
-SAFE_REJECT_REASONS = {"malformed_ciphertext", "wrong_recipient", "signature_invalid", "outer_inner_mismatch", "invalid_envelope"}
+SAFE_REJECT_REASONS = {
+	"malformed_ciphertext",
+	"wrong_recipient",
+	"signature_invalid",
+	"outer_inner_mismatch",
+	"delivery_claim_invalid",
+	"content_hash_mismatch",
+	"content_unavailable",
+	"content_expired",
+	"invalid_envelope",
+}
 
 
 @dataclass
@@ -46,7 +59,11 @@ class ServerState:
 		self.config.state_dir.mkdir(parents=True, exist_ok=True)
 		self.queue = MessageQueue(self.config.state_dir, self.config.rejected_policy)
 		self.replay = ReplayStore(self.config.state_dir)
+		self.content = ContentStore(self.config.state_dir)
 		self.log = StructuredLog(self.config.state_dir / "logs" / "structured.jsonl")
+		self._content_transfers: set[tuple[str, str, str]] = set()
+		self._content_transfer_lock = asyncio.Lock()
+		self.content.prune_expired()
 		self._validate_config()
 
 	def _validate_config(self) -> None:
@@ -77,14 +94,35 @@ class ServerState:
 		require(identity is not None, "unknown_recipient", "unknown local identity", 404)
 		return identity
 
-	def accept_envelope_for_local(self, envelope: dict[str, Any]) -> None:
-		validate_encrypted_envelope(envelope, ProtocolLimits())
+	def accept_envelope_for_local(self, envelope: dict[str, Any]) -> str:
+		validate_delivery_envelope(envelope, ProtocolLimits())
 		recipient = envelope["recipient_route"]["client_ref"]
 		self.local_identity(recipient)
-		scope = f"{recipient}"
-		require(self.replay.remember(scope, envelope["message_id"]), "duplicate_message_id", "duplicate message id", 409)
+		is_reference = delivery_envelope_uses_content_reference(envelope)
+		if is_reference:
+			require(not self.content.is_expired(envelope["content_id"]), "content_expired", "referenced content has expired", 410)
+			content_object = self.content.get(envelope["content_id"])
+			require(content_object is not None, "content_unavailable", "referenced content is not available", 503)
+			require(
+				content_object["content_sha256"] == envelope["content_sha256"],
+				"content_hash_mismatch",
+				"referenced content hash does not match envelope",
+			)
+		if is_reference:
+			replay_state = self.replay.remember_delivery(
+				f"{recipient}",
+				envelope["message_id"],
+				hashlib.sha256(canonical_json_bytes(envelope)).hexdigest(),
+			)
+			if replay_state == "conflict":
+				raise EndpointError("duplicate_message_id", "message id is bound to different delivery data", 409)
+			if replay_state == "same":
+				return "already_queued"
+		else:
+			require(self.replay.remember(f"{recipient}", envelope["message_id"]), "duplicate_message_id", "duplicate message id", 409)
 		require(self.queue.add(recipient, envelope), "duplicate_message_id", "duplicate message id", 409)
 		self.log.write("message_queued", client_ref=recipient, message_id=envelope["message_id"])
+		return "queued"
 
 	def is_local_server_url(self, server_url: str) -> bool:
 		return _normalize_configured_url(server_url) == _normalize_configured_url(self.config.server_url)
@@ -102,6 +140,7 @@ def create_app(config: ServerConfig) -> FastAPI:
 
 	@app.get("/v1/health")
 	async def health() -> dict[str, str]:
+		state.content.prune_expired()
 		return {"server_time_utc": now_iso(), "status": "ok"}
 
 	@app.post("/v1/client/discover")
@@ -129,20 +168,56 @@ def create_app(config: ServerConfig) -> FastAPI:
 		client_ref = body.get("client_ref")
 		state.authenticate_client(client_ref, request.headers.get("authorization"))
 		envelope = body.get("envelope")
-		validate_encrypted_envelope(envelope)
+		validate_delivery_envelope(envelope)
 		if state.is_local_server_url(envelope["recipient_route"]["server_url"]):
-			state.accept_envelope_for_local(envelope)
+			status = state.accept_envelope_for_local(envelope)
 			state.log.write("message_routed_local", client_ref=client_ref, message_id=envelope["message_id"])
-			return {"status": "queued", "message_id": envelope["message_id"]}
+			return {"status": status, "message_id": envelope["message_id"]}
 		destination = validate_https_url(envelope["recipient_route"]["server_url"], config.federation_policy, "outbound")
 		try:
 			async with httpx.AsyncClient(verify=httpx_verify_config(config.ca_bundle), timeout=5.0, follow_redirects=False) as client:
+				if delivery_envelope_uses_content_reference(envelope):
+					require(not state.content.is_expired(envelope["content_id"]), "content_expired", "referenced content has expired", 410)
+					transfer_key = (destination, envelope["content_id"], envelope["content_sha256"])
+					async with state._content_transfer_lock:
+						if transfer_key not in state._content_transfers:
+							content_object = state.content.get(envelope["content_id"])
+							require(content_object is not None, "content_unavailable", "referenced content is not available", 503)
+							content_response = await client.post(
+								f"{destination}/v1/federation/content",
+								json=content_object,
+								headers={"endpoint-peer-url": config.server_url},
+							)
+							_require_success_response(content_response, "federation content delivery failed")
+							state._content_transfers.add(transfer_key)
 				response = await client.post(f"{destination}/v1/federation/messages", json=envelope)
 		except httpx.RequestError as exc:
 			raise EndpointError("delivery_failed", "federation delivery failed", 502, detail=type(exc).__name__) from exc
 		_require_success_response(response, "federation delivery failed")
 		state.log.write("message_proxied", client_ref=client_ref, message_id=envelope["message_id"])
 		return {"status": "proxied", "message_id": envelope["message_id"]}
+
+	@app.post("/v1/client/content")
+	async def client_content(request: Request) -> dict[str, str]:
+		body = await _request_json_object(request)
+		client_ref = body.get("client_ref")
+		state.authenticate_client(client_ref, request.headers.get("authorization"))
+		content_object = body.get("content")
+		validate_content_object(content_object, ProtocolLimits())
+		status = state.content.put(content_object)
+		state.log.write("content_stored", client_ref=client_ref, content_id=content_object["content_id"], status=status)
+		return {"status": status, "content_id": content_object["content_id"]}
+
+	@app.get("/v1/client/content/{content_id}")
+	async def client_get_content(content_id: str, request: Request) -> Any:
+		client_ref = request.headers.get("x-endpoint-client-ref")
+		state.authenticate_client(client_ref, request.headers.get("authorization"))
+		expired = state.content.is_expired(content_id)
+		content_object = state.content.get(content_id)
+		if expired:
+			raise EndpointError("content_expired", "content is no longer available", 410)
+		require(content_object is not None, "content_unavailable", "content is not available", 404)
+		return content_object
 
 	@app.get("/v1/federation/identity/{client_ref}")
 	async def federation_identity(client_ref: str, request: Request) -> Any:
@@ -157,8 +232,20 @@ def create_app(config: ServerConfig) -> FastAPI:
 		envelope = await _request_json_object(request)
 		if config.federation_policy.inbound_whitelist:
 			validate_https_url(envelope.get("sender_route", {}).get("server_url", ""), config.federation_policy, "inbound")
-		state.accept_envelope_for_local(envelope)
-		return {"status": "queued", "message_id": envelope["message_id"]}
+		status = state.accept_envelope_for_local(envelope)
+		return {"status": status, "message_id": envelope["message_id"]}
+
+	@app.post("/v1/federation/content")
+	async def federation_content(request: Request) -> dict[str, str]:
+		if config.federation_policy.inbound_whitelist:
+			peer = request.headers.get("endpoint-peer-url")
+			require(peer is not None, "forbidden_peer", "peer identity is required", 403)
+			validate_https_url(peer, config.federation_policy, "inbound")
+		content_object = await _request_json_object(request)
+		validate_content_object(content_object, ProtocolLimits())
+		status = state.content.put(content_object)
+		state.log.write("content_federated", content_id=content_object["content_id"], status=status)
+		return {"status": status, "content_id": content_object["content_id"]}
 
 	@app.websocket("/v1/client/{client_ref}/inbox")
 	async def websocket_inbox(websocket: WebSocket, client_ref: str) -> None:
@@ -181,12 +268,14 @@ def create_app(config: ServerConfig) -> FastAPI:
 					continue
 				if frame_type == "ack":
 					accepted = state.queue.ack(client_ref, message_id)
+					state.content.prune_expired()
 					if accepted:
 						state.log.write("message_acked", client_ref=client_ref, message_id=message_id)
 					await _send_wss_result(websocket, "ack_result", message_id, accepted)
 				elif frame_type == "reject":
 					reason = _safe_reject_reason(frame.get("reason"))
 					accepted = state.queue.reject(client_ref, message_id, reason)
+					state.content.prune_expired()
 					if accepted:
 						state.log.write("message_rejected", client_ref=client_ref, message_id=message_id, reason=reason)
 					await _send_wss_result(websocket, "reject_result", message_id, accepted)

@@ -149,6 +149,43 @@ fn encrypt_to_inner(public_key_armored: &str, plaintext: &[u8]) -> Result<String
 }
 
 #[pyfunction]
+fn encrypt_to_many(public_keys_armored: Vec<String>, plaintext: &[u8]) -> PyResult<String> {
+	encrypt_to_many_inner(public_keys_armored, plaintext).map_err(to_crypto_failed)
+}
+
+fn encrypt_to_many_inner(public_keys_armored: Vec<String>, plaintext: &[u8]) -> Result<String> {
+	if public_keys_armored.is_empty() {
+		return Err(anyhow!("no encryption recipients"));
+	}
+	let certs: Vec<Cert> = public_keys_armored.iter().map(|key| parse_cert(key)).collect::<Result<_>>()?;
+	let policy = StandardPolicy::new();
+	let recipients: Vec<_> = certs
+		.iter()
+		.flat_map(|cert| {
+			cert.keys()
+				.with_policy(&policy, None)
+				.supported()
+				.alive()
+				.revoked(false)
+				.for_transport_encryption()
+		})
+		.collect();
+	if recipients.is_empty() {
+		return Err(anyhow!("no encryption key"));
+	}
+	let mut sink = Vec::new();
+	{
+		let message = Message::new(&mut sink);
+		let message = Armorer::new(message).kind(armor::Kind::Message).build()?;
+		let message = Encryptor::for_recipients(message, recipients).build()?;
+		let mut writer = LiteralWriter::new(message).build()?;
+		writer.write_all(plaintext)?;
+		writer.finalize()?;
+	}
+	String::from_utf8(sink).map_err(Into::into)
+}
+
+#[pyfunction]
 fn decrypt(py: Python<'_>, secret_key_armored: &str, ciphertext_armored: &str) -> PyResult<Py<PyBytes>> {
 	let bytes = decrypt_inner(secret_key_armored, ciphertext_armored).map_err(to_malformed_ciphertext)?;
 	Ok(PyBytes::new_bound(py, &bytes).into())
@@ -276,6 +313,7 @@ fn endpoint_openpgp_sequoia(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyR
 	module.add_function(wrap_pyfunction!(sign_detached, module)?)?;
 	module.add_function(wrap_pyfunction!(verify_detached, module)?)?;
 	module.add_function(wrap_pyfunction!(encrypt_to, module)?)?;
+	module.add_function(wrap_pyfunction!(encrypt_to_many, module)?)?;
 	module.add_function(wrap_pyfunction!(decrypt, module)?)?;
 	Ok(())
 }
