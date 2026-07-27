@@ -42,7 +42,7 @@ This repository provides a reference implementation and demo environment. It inc
 
 ### Project State
 
-The current implementation is functional enough to demonstrate the protocol's main behavior: signed identities, authenticated client access, server-routed delivery, offline queueing, WSS mailbox delivery, ack/reject handling, replay protection, and route key-change detection. The current protocol version is endpoint-poc-1. That version should be treated as unstable. Message formats, validation rules, setup workflows, and storage behavior may change as the protocol is refined.
+The current implementation demonstrates signed identities, authenticated client access, server-routed delivery, offline queueing, WSS mailbox delivery, ack/reject handling, replay protection, route key-change detection, reusable signed content, multi-recipient delivery, private Bcc claims, content references, federation content transfer, and retryable fan-out. The current protocol version is endpoint-poc-2. That version should be treated as unstable as everything is subject to change as the protocol is refined.
 
 The code has not been independently audited and should not be used for production communication.
 
@@ -64,7 +64,7 @@ The code has not been independently audited and should not be used for productio
 
 The demo requires:
 
-- Python 3.12,
+- Python 3.12.4,
 - The endpoint-openpgp-sequoia backend,
 - The Python dependencies listed in pyproject.toml, and
 - A shell environment where the endpoint CLI is available.
@@ -73,7 +73,39 @@ For local development, the repository also includes a Nix flake. The Nix environ
 
 ### Install From Release
 
-Download the release assets for your platform from the GitHub Release. Releases include the protocol wheel, prebuilt endpoint-openpgp-sequoia backend wheels for supported platforms, and SHA-256 hashes for the assets. Download endpoint_protocol-0.1.0-py3-none-any.whl and the endpoint_openpgp_sequoia wheel that matches your operating system and CPU architecture. Verify the downloaded files before installing them.
+Download two wheel files from the GitHub Release and place them in the same directory:
+
+- `endpoint_protocol-0.1.0-py3-none-any.whl` is the platform-independent Endpoint protocol package.
+- `endpoint_openpgp_sequoia-0.1.0-...whl` is the native OpenPGP backend for your operating system and CPU architecture.
+
+The backend wheel has a long, platform-specific filename. For example, endpoint_openpgp_sequoia-0.1.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl is a valid Linux x86_64 wheel; do not rename it. In the commands below, * is a shell wildcard that matches the rest of that filename. If the directory contains multiple backend wheels, use the exact filename for your platform instead of the wildcard.
+
+Run the commands below from the directory containing both wheels. The protocol wheel and the matching backend wheel must be installed together.
+
+#### Linux (Debian or Ubuntu)
+
+Debian-based distributions may reject direct installation into the system Python with an externally-managed-environment error because of PEP 668. Create and activate a virtual environment instead:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-venv
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+sha256sum endpoint_protocol-*.whl
+sha256sum endpoint_openpgp_sequoia-*.whl
+```
+
+Compare the SHA-256 values with the release notes before installing, then run:
+
+```bash
+python -m pip install ./endpoint_protocol-*.whl ./endpoint_openpgp_sequoia-*.whl
+```
+
+If `python3 --version` is older than 3.12, install a newer Python and use its executable (for example, python3.12) when creating the virtual environment. Once the environment is activated, use `python -m pip`; it points to the virtual environment and avoids modifying the system Python. Do not use `--break-system-packages` for this project.
+
+#### Windows (PowerShell)
 
 On Windows in PowerShell:
 ```
@@ -81,45 +113,67 @@ Get-FileHash .\endpoint_protocol-0.1.0-py3-none-any.whl -Algorithm SHA256
 Get-FileHash .\endpoint_openpgp_sequoia-0.1.0-*.whl -Algorithm SHA256
 ```
 
-On Linux:
-```
-sha256sum endpoint_protocol-0.1.0-py3-none-any.whl
-sha256sum endpoint_openpgp_sequoia-0.1.0-*.whl
-```
-
-On macOS:
-```
-shasum -a 256 endpoint_protocol-0.1.0-py3-none-any.whl
-shasum -a 256 endpoint_openpgp_sequoia-0.1.0-*.whl
-```
-
-After the hashes match the release notes, install both wheels together. On Windows in PowerShell:
+After verifying the hashes:
 ```
 $backend = Get-ChildItem .\endpoint_openpgp_sequoia-0.1.0-*.whl | Select-Object -First 1
 python -m pip install $backend.FullName .\endpoint_protocol-0.1.0-py3-none-any.whl
 ```
 
-On macOS or Linux:
-```
-python -m pip install ./endpoint_openpgp_sequoia-0.1.0-*.whl ./endpoint_protocol-0.1.0-py3-none-any.whl
+#### macOS
+
+Create a virtual environment so the installation is isolated from the system Python:
+
+```bash
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+shasum -a 256 endpoint_protocol-*.whl
+shasum -a 256 endpoint_openpgp_sequoia-*.whl
 ```
 
-To build the wheels locally from the repository root instead of using release assets:
+After comparing the SHA-256 values with the release notes, install both wheels:
+
+```bash
+python -m pip install ./endpoint_protocol-*.whl ./endpoint_openpgp_sequoia-*.whl
 ```
+
+#### Verify the installation
+
+With the virtual environment active on Linux or macOS (or with the normal Python environment on Windows), run:
+
+```
+python -c "import endpoint, endpoint_openpgp_sequoia as backend; print(endpoint.PROTOCOL_VERSION); print(backend.__file__)"
+endpoint --help
+```
+
+If the command prints endpoint-poc-2 and a backend path, both packages are installed. The endpoint command is available while the virtual environment is active; run `source .venv/bin/activate` again in a new shell before using it.
+
+### Build and install from source
+
+If a release does not provide the protocol wheel, or if your platform does not have a compatible prebuilt backend wheel, build both wheels from the repository. This requires Python 3.12 or newer, Rust/Cargo, and a native build toolchain.
+
+On Linux or macOS, create a virtual environment first:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip wheel setuptools maturin
 python -m pip wheel . --no-deps --no-build-isolation -w dist
 python -m maturin build --manifest-path openpgp-sequoia/Cargo.toml --release --out dist
+python -m pip install ./dist/endpoint_protocol-*.whl ./dist/endpoint_openpgp_sequoia-*.whl
 ```
 
-Install the locally built wheels. On Windows in PowerShell:
+On Windows in PowerShell:
+
 ```
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip wheel setuptools maturin
+python -m pip wheel . --no-deps --no-build-isolation -w dist
+python -m maturin build --manifest-path openpgp-sequoia/Cargo.toml --release --out dist
 $backend = Get-ChildItem .\dist\endpoint_openpgp_sequoia-*.whl | Select-Object -First 1
 python -m pip install $backend.FullName .\dist\endpoint_protocol-0.1.0-py3-none-any.whl
-```
-
-On macOS or Linux:
-```
-python -m pip install dist/endpoint_openpgp_sequoia-*.whl dist/endpoint_protocol-0.1.0-py3-none-any.whl
 ```
 
 ### How to Run the Demo
@@ -191,8 +245,8 @@ The protocol is designed for client-owned cryptography and server-routed deliver
 ```mermaid
 flowchart LR
     ClientA(("Client\nprivate keys stay local\nsigns, encrypts, decrypts, verifies\ntrusts fingerprints locally"))
-    ServerA{"Server\nhosts signed public identities\nroutes encrypted envelopes\nstores offline ciphertext"}
-    ServerB{"Server\nhosts signed public identities\nroutes encrypted envelopes\nstores offline ciphertext"}
+    ServerA{"Server\nhosts signed public identities\nstores shared ciphertext\nroutes delivery envelopes\nqueues offline deliveries"}
+    ServerB{"Server\nhosts signed public identities\nstores shared ciphertext\nroutes delivery envelopes\nqueues offline deliveries"}
     ClientB(("Client\nprivate keys stay local\nsigns, encrypts, decrypts, verifies\ntrusts fingerprints locally"))
 
     ClientA <--> |"authenticated secure transport"| ServerA
@@ -200,9 +254,9 @@ flowchart LR
     ServerB <--> |"authenticated secure transport"| ClientB
 ```
 
-In a typical cross-server conversation, each client uses its own server as a routing and mailbox provider. The sender's client discovers the recipient's signed public identity through the recipient's server, verifies that identity locally, then creates a signed inner message containing the plaintext body and routing context. That signed payload is encrypted to the recipient's public key before it leaves the sender's device.
+In a typical cross-server conversation, each client uses its own server as a routing and mailbox provider. The sender's client discovers the recipient's signed public identity through the recipient's server, verifies that identity locally, then creates one signed content object and one multi-recipient ciphertext. The sender uploads that ciphertext once to its home server. Each recipient receives a separate signed, recipient-encrypted delivery claim and a small reference to the shared content object.
 
-The sender's server receives only the encrypted envelope and the routing metadata needed to forward it to the recipient's server. The recipient's server can store the encrypted envelope until the recipient comes online, but it cannot read or alter the message body without detection. When the recipient's client receives the envelope, it decrypts it locally, verifies the sender's signature and fingerprint, and compares the inner signed routing fields against the outer envelope before showing the message.
+The sender's server receives only encrypted content, encrypted delivery claims, and the routing metadata needed to forward each envelope. For a remote recipient it transfers the encrypted content object to the recipient's server before forwarding the reference envelope. The recipient's server can store the encrypted content and envelope until the recipient comes online, but it cannot read or alter the message body or authorize a different recipient without detection. When the recipient's client receives an envelope, it fetches the referenced ciphertext, decrypts the delivery claim and content locally, verifies both sender signatures, and compares the authenticated claim against the outer routing envelope before showing the content.
 
 ```mermaid
 flowchart LR
@@ -266,7 +320,7 @@ The JSON form is:
 ```json
 {
   "kind": "endpoint-contact",
-  "protocol_version": "endpoint-poc-1",
+  "protocol_version": "endpoint-poc-2",
   "server_url": "https://example.com",
   "client_ref": "bob",
   "endpoint_fingerprint": "ep1:...",
@@ -296,7 +350,7 @@ A public identity is the signed public object that a server can host for discove
 
 ```json
 {
-  "protocol_version": "endpoint-poc-1",
+  "protocol_version": "endpoint-poc-2",
   "client_ref": "alice",
   "public_key_armored": "<OpenPGP public key>",
   "endpoint_fingerprint": "<fingerprint derived from public_key_armored>",
@@ -310,12 +364,43 @@ A public identity is the signed public object that a server can host for discove
 
 The identity_signature signs the canonical JSON form of protocol_version, client_ref, public_key_armored, endpoint_fingerprint, and metadata. A server may store and return this identity object, but changing any signed field should cause client verification to fail.
 
-The outer message envelope is the server-readable object used for routing and mailbox storage:
+The signed content object is reusable across deliveries. Its signature covers the content ID, content type, creation time, sender key, sender route, and generic content value:
 
 ```json
 {
-  "protocol_version": "endpoint-poc-1",
-  "message_id": "<unique message id>",
+  "protocol_version": "endpoint-poc-2",
+  "content_id": "<shared content id>",
+  "sender_fingerprint": "<Alice's endpoint fingerprint>",
+  "signature_algorithm": "openpgp-detached",
+  "payload": {
+    "protocol_version": "endpoint-poc-2",
+    "content_id": "<shared content id>",
+    "content_type": "message",
+    "created_at": "<UTC>",
+    "sender_public_key_armored": "<Alice's OpenPGP public key>",
+    "sender_fingerprint": "<Alice's endpoint fingerprint>",
+    "sender_route": {
+      "server_url": "https://alice.example.com",
+      "client_ref": "alice"
+    },
+    "content": {
+      "body": "<plaintext message body>",
+      "visible_to": [{"server_url": "https://bob.example.com", "client_ref": "bob"}],
+      "visible_cc": []
+    }
+  },
+  "signature": "<OpenPGP detached signature over payload>"
+}
+```
+
+The outer delivery envelope is the server-readable object used for routing and mailbox storage. It references shared encrypted content so the ciphertext is stored once per server, while delivery_ciphertext_armored contains a recipient-specific encrypted delivery claim:
+
+```json
+{
+  "protocol_version": "endpoint-poc-2",
+  "message_id": "<unique recipient delivery id>",
+  "content_id": "<shared content id>",
+  "content_sha256": "<SHA-256 of signed content>",
   "sender_route": {
     "server_url": "https://alice.example.com",
     "client_ref": "alice"
@@ -325,31 +410,47 @@ The outer message envelope is the server-readable object used for routing and ma
     "client_ref": "bob"
   },
   "recipient_fingerprint": "<Bob's endpoint fingerprint>",
+  "recipient_role": "to",
   "created_at": "<UTC>",
-  "ciphertext_armored": "<OpenPGP encrypted signed inner message>",
-  "ciphertext_sha256": "<SHA-256 of ciphertext_armored>"
+  "content_ref": {
+    "content_id": "<shared content id>",
+    "content_sha256": "<SHA-256 of signed content>"
+  },
+  "delivery_ciphertext_armored": "<OpenPGP encrypted delivery claim for Bob>",
+  "delivery_ciphertext_sha256": "<SHA-256 of delivery_ciphertext_armored>"
 }
 ```
 
-The ciphertext decrypts to a signed inner message:
+The referenced content object is stored by the sender's and recipient's servers, never decrypted by either server, and is fetched through an authenticated client endpoint:
 
 ```json
 {
-  "protocol_version": "endpoint-poc-1",
+  "protocol_version": "endpoint-poc-2",
+  "content_id": "<shared content id>",
+  "content_sha256": "<SHA-256 of signed content>",
+  "ciphertext_armored": "<one OpenPGP ciphertext addressed to all recipients>",
+  "ciphertext_sha256": "<SHA-256 of ciphertext_armored>",
+  "size_bytes": 1234,
+  "created_at": "<UTC>",
+  "expires_at": "<UTC retention deadline>"
+}
+```
+
+Content uploads are idempotent for the same content_id and hashes. A reference delivery is accepted only after the local server has the matching content object; repeated identical reference deliveries are safe retries, while a reused message_id with different authenticated data is rejected.
+
+The delivery ciphertext decrypts to a sender-signed claim:
+
+```json
+{
+  "protocol_version": "endpoint-poc-2",
   "sender_fingerprint": "<Alice's endpoint fingerprint>",
   "signature_algorithm": "openpgp-detached",
   "payload": {
-    "protocol_version": "endpoint-poc-1",
+    "protocol_version": "endpoint-poc-2",
     "message_id": "<same message id as outer envelope>",
-    "body": "<plaintext message body>",
+    "content_id": "<same content id as outer envelope>",
+    "content_sha256": "<same signed-content hash as outer envelope>",
     "created_at": "<same timestamp as outer envelope>",
-    "sender_public_key_armored": "<Alice's OpenPGP public key>",
-    "sender_metadata": {
-      "username": "alice",
-      "display_name": "Alice"
-    },
-    "sender_fingerprint": "<Alice's endpoint fingerprint>",
-    "recipient_fingerprint": "<Bob's endpoint fingerprint>",
     "sender_route": {
       "server_url": "https://alice.example.com",
       "client_ref": "alice"
@@ -357,15 +458,18 @@ The ciphertext decrypts to a signed inner message:
     "recipient_route": {
       "server_url": "https://bob.example.com",
       "client_ref": "bob"
-    }
+    },
+    "recipient_fingerprint": "<Bob's endpoint fingerprint>",
+    "recipient_role": "to",
+    "sender_fingerprint": "<Alice's endpoint fingerprint>"
   },
   "signature": "<OpenPGP detached signature over payload>"
 }
 ```
 
-The signature signs the canonical JSON form of payload. The recipient must derive the sender fingerprint from sender_public_key_armored, verify that it matches both sender fingerprint fields, verify the detached signature, and confirm that recipient_fingerprint matches the recipient's own key.
+The content and delivery claim each sign the canonical JSON form of their own payload. The recipient derives Alice's fingerprint from the public key in the signed content, verifies both signatures, confirms the content hash, and confirms that the claim's recipient fingerprint matches the recipient's own key.
 
-The recipient must also compare the outer envelope against the signed inner payload. At minimum, message_id, protocol_version, sender_route, recipient_route, recipient_fingerprint, and created_at must match. A mismatch means the server-visible routing envelope and the sender-signed payload disagree, so the message should be rejected.
+The recipient must also compare the outer envelope against the signed delivery claim. At minimum, message_id, protocol_version, content_id, content_sha256, sender_route, recipient_route, recipient_fingerprint, recipient_role, and created_at must match. A mismatch means the server-visible routing envelope and the sender-authorized claim disagree, so the delivery must be rejected. Bcc recipients are never included in the signed visible_to or visible_cc content fields; their authorization exists only in their private claim.
 
 ### Limitations and Non-Goals
 
@@ -377,6 +481,8 @@ It does not guarantee deletion. A server can remove acknowledged envelopes from 
 
 It also cannot protect against a compromised endpoint. If malware, a hostile operating system, or a malicious client has access to plaintext before encryption or after decryption, the protocol cannot keep that plaintext secret. The protocol's security boundary is the honest client holding its own keys and verifying what it receives.
 
+Reference delivery reduces duplicate encrypted payload storage and upload work, but it does not hide fan-out. Servers can observe recipient routes, delivery timing, and that multiple envelopes refer to the same content_id and content hash. The current content store also uses a bounded retention timestamp and local cleanup; it does not provide cryptographic deletion, resumable range downloads, or external blob storage.
+
 Lastly, the protocol cannot independently prove that a first-seen route belongs to the real-world person a sender expects. A malicious server could substitute a different valid identity on first contact. Contact artifacts are a simple way to add out-of-band assurance for this case.
 
 ### History (Summarized)
@@ -385,6 +491,6 @@ Elias Murphy, Chief Executive Officer of Raven Technologies Group, came up with 
 
 As 2025 progressed, the concept developed throughout discussions and hypotheticals, and some brief mentions of the concept were discussed in community channels, but Dragonet was ultimately shelved as a concept while they focused on higher-priority initiatives.
 
-By early June 2026, Murphy had returned to the idea once again to build a working proof-of-concept code implementation and truly test the feasibility of the concept. After several days of planning and designing, and three days of programming with input and assistance from Pharoah, the PoC was completed. An additional two days were spent testing and refining with assistance from some of Murphy's close friends and members of the Raven community.
+By early June 2026, Murphy had returned to the idea once again to build a working proof-of-concept code implementation and truly test the feasibility of the concept. After several days of planning and designing, and three days of programming with input and assistance from Pharoah, the initial PoC was completed. An additional two days were spent testing and refining with assistance from some of Murphy's close friends and members of the Raven community.
 
 At some point during development, Murphy decided to change the name from the Dragonet protocol to the Endpoint protocol, and designed the logo for it in about an hour using PaintDotNet.

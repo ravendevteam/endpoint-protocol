@@ -18,7 +18,7 @@ class EndpointError(Exception):
 			error["hint"] = self.hint
 		if debug and self.detail:
 			error["detail"] = self.detail
-		return {"protocol_version": "endpoint-poc-1", "error": error}
+		return {"protocol_version": "endpoint-poc-2", "error": error}
 
 
 def require(condition: bool, code: str, message: str, status_code: int = 400, detail: str | None = None, hint: str | None = None) -> None:

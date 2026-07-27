@@ -12,7 +12,8 @@ from .transport import normalize_server_url
 CONTACT_KIND = "endpoint-contact"
 CONTACT_URI_SCHEME = "endpoint"
 CONTACT_URI_PATH = "contact"
-CONTACT_URI_QUERY_KEYS = {"server_url", "client_ref", "fingerprint", "display_name", "username"}
+CONTACT_URI_QUERY_KEYS = {"server_url", "client_ref", "fingerprint", "display_name", "username", "protocol_version"}
+CONTACT_PROTOCOL_VERSIONS = {"endpoint-poc-1", PROTOCOL_VERSION}
 FINGERPRINT_RE = re.compile(r"^ep1:[a-z2-7]{52}$")
 CLIENT_REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -45,7 +46,7 @@ def contact_from_identity(server_url: str, identity: dict[str, Any]) -> dict[str
 def normalize_contact(value: Any) -> dict[str, Any]:
 	require(isinstance(value, dict), "invalid_contact", "contact must be a JSON object")
 	require(value.get("kind") == CONTACT_KIND, "invalid_contact", "contact kind is invalid")
-	require(value.get("protocol_version") == PROTOCOL_VERSION, "invalid_contact", "contact protocol version is unsupported")
+	require(value.get("protocol_version") in CONTACT_PROTOCOL_VERSIONS, "invalid_contact", "contact protocol version is unsupported")
 	server_url = _normalize_contact_server_url(_require_string(value.get("server_url"), "server_url"))
 	client_ref = _validate_client_ref(value.get("client_ref"))
 	fingerprint = validate_endpoint_fingerprint(value.get("endpoint_fingerprint"))
@@ -53,7 +54,7 @@ def normalize_contact(value: Any) -> dict[str, Any]:
 	validate_metadata(metadata)
 	out = {
 		"kind": CONTACT_KIND,
-		"protocol_version": PROTOCOL_VERSION,
+		"protocol_version": value["protocol_version"],
 		"server_url": server_url,
 		"client_ref": client_ref,
 		"endpoint_fingerprint": fingerprint,
@@ -74,6 +75,7 @@ def contact_to_uri(contact: dict[str, Any]) -> str:
 		"server_url": normalized["server_url"],
 		"client_ref": normalized["client_ref"],
 		"fingerprint": normalized["endpoint_fingerprint"],
+		"protocol_version": normalized["protocol_version"],
 	}
 	metadata = normalized.get("metadata")
 	if isinstance(metadata, dict):
@@ -104,7 +106,7 @@ def contact_from_uri(uri: str) -> dict[str, Any]:
 			metadata[key] = value[0]
 	contact = {
 		"kind": CONTACT_KIND,
-		"protocol_version": PROTOCOL_VERSION,
+		"protocol_version": query.get("protocol_version", [PROTOCOL_VERSION])[0],
 		"server_url": server_url,
 		"client_ref": client_ref,
 		"endpoint_fingerprint": fingerprint,

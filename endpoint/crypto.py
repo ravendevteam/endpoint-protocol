@@ -74,6 +74,13 @@ class OpenPgpContext:
 		except Exception as exc:
 			raise _map_backend_error(exc, "crypto_failed", "OpenPGP encryption failed") from exc
 
+	def encrypt_to_many(self, public_keys_armored: list[str], payload: bytes) -> str:
+		require(isinstance(public_keys_armored, list) and public_keys_armored, "crypto_failed", "at least one encryption recipient is required")
+		try:
+			return _backend().encrypt_to_many(public_keys_armored, payload)
+		except Exception as exc:
+			raise _map_backend_error(exc, "crypto_failed", "OpenPGP multi-recipient encryption failed") from exc
+
 	def decrypt(self, ciphertext_armored: str) -> bytes:
 		try:
 			return bytes(_backend().decrypt(self._read_secret_key(), ciphertext_armored))

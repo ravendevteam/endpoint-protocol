@@ -49,13 +49,30 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build wheel
+      - name: Build protocol wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip wheel . --no-deps --no-build-isolation -w dist
+
+      - name: Build backend wheel
         uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --manifest-path openpgp-sequoia/Cargo.toml --release --out dist
           target: ${{ matrix.target }}
           manylinux: auto
+
+      - name: Verify wheel set
+        shell: python
+        run: |
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          protocol_wheels = [wheel for wheel in wheels if wheel.name.startswith("endpoint_protocol-")]
+          backend_wheels = [wheel for wheel in wheels if wheel.name.startswith("endpoint_openpgp_sequoia-")]
+          if len(protocol_wheels) != 1 or len(backend_wheels) != 1:
+              raise SystemExit(f"expected one protocol and one backend wheel, found: {[wheel.name for wheel in wheels]}")
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -111,11 +128,13 @@ jobs:
           import sys
 
           wheels = sorted(pathlib.Path("dist").glob("*.whl"))
-          if len(wheels) != 1:
-          	raise SystemExit(f"expected exactly one wheel, found {len(wheels)}")
+          protocol_wheels = [wheel for wheel in wheels if wheel.name.startswith("endpoint_protocol-")]
+          backend_wheels = [wheel for wheel in wheels if wheel.name.startswith("endpoint_openpgp_sequoia-")]
+          if len(protocol_wheels) != 1 or len(backend_wheels) != 1:
+              raise SystemExit(f"expected one protocol and one backend wheel, found: {[wheel.name for wheel in wheels]}")
 
           subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
-          subprocess.check_call([sys.executable, "-m", "pip", "install", str(wheels[0])])
+          subprocess.check_call([sys.executable, "-m", "pip", "install", str(protocol_wheels[0]), str(backend_wheels[0])])
           subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps"])
           subprocess.check_call([
           	sys.executable,
