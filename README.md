@@ -3,7 +3,11 @@
 </p>
 <hr />
 
+<div align="justify">
 The Endpoint Protocol is an OpenPGP-based encrypted messaging protocol for secure server-routed communication. This repository contains a reference implementation, demo server, demo CLI, and test suite.
+</div>
+
+<br />
 
 > [!WARNING]  
 > The code in this repository serves as a Proof-of-Concept and should not be considered stable or production ready.
@@ -25,6 +29,8 @@ The Endpoint Protocol is an OpenPGP-based encrypted messaging protocol for secur
   - [Message Structure](#message-structure)
   - [Limitations and Non-Goals](#limitations-and-non-goals)
   - [History (Summarized)](#history-summarized)
+
+<div align="justify">
 
 ## Repository Overview
 
@@ -494,3 +500,4 @@ As 2025 progressed, the concept developed throughout discussions and hypothetica
 By early June 2026, Murphy had returned to the idea once again to build a working proof-of-concept code implementation and truly test the feasibility of the concept. After several days of planning and designing, and three days of programming with input and assistance from Pharoah, the initial PoC was completed. An additional two days were spent testing and refining with assistance from some of Murphy's close friends and members of the Raven community.
 
 At some point during development, Murphy decided to change the name from the Dragonet protocol to the Endpoint protocol, and designed the logo for it in about an hour using PaintDotNet.
+</div>
