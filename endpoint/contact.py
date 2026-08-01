@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from .crypto import endpoint_fingerprint
 from .errors import EndpointError, require
-from .protocol import PROTOCOL_VERSION, validate_identity_envelope, validate_metadata
+from .protocol import FINGERPRINT_RE, PROTOCOL_VERSION, validate_identity_envelope, validate_metadata
 from .transport import normalize_server_url
 
 CONTACT_KIND = "endpoint-contact"
@@ -14,7 +14,6 @@ CONTACT_URI_SCHEME = "endpoint"
 CONTACT_URI_PATH = "contact"
 CONTACT_URI_QUERY_KEYS = {"server_url", "client_ref", "fingerprint", "display_name", "username", "protocol_version"}
 CONTACT_PROTOCOL_VERSIONS = {"endpoint-poc-1", PROTOCOL_VERSION}
-FINGERPRINT_RE = re.compile(r"^ep1:[a-z2-7]{52}$")
 CLIENT_REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 

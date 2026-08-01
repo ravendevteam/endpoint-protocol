@@ -53,16 +53,14 @@ fn generate_identity_inner(name: &str, email: &str) -> Result<HashMap<String, St
 }
 
 #[pyfunction]
-fn canonical_public_key_bytes(py: Python<'_>, public_key_armored: &str) -> PyResult<Py<PyBytes>> {
-	let bytes = canonical_public_key_bytes_inner(public_key_armored).map_err(to_crypto_failed)?;
+fn openpgp_fingerprint_bytes(py: Python<'_>, public_key_armored: &str) -> PyResult<Py<PyBytes>> {
+	let bytes = openpgp_fingerprint_bytes_inner(public_key_armored).map_err(to_crypto_failed)?;
 	Ok(PyBytes::new_bound(py, &bytes).into())
 }
 
-fn canonical_public_key_bytes_inner(public_key_armored: &str) -> Result<Vec<u8>> {
+fn openpgp_fingerprint_bytes_inner(public_key_armored: &str) -> Result<Vec<u8>> {
 	let cert = parse_cert(public_key_armored)?;
-	let mut out = Vec::new();
-	cert.export(&mut out)?;
-	Ok(out)
+	Ok(cert.fingerprint().as_bytes().to_vec())
 }
 
 #[pyfunction]
@@ -301,6 +299,50 @@ fn to_malformed_ciphertext(err: anyhow::Error) -> PyErr {
 	MalformedCiphertext::new_err(err.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn rfc9580_v6_fingerprint_bytes_are_native_sha256_bytes() {
+		let (cert, _) = CertBuilder::general_purpose(["Endpoint V6 <v6@endpoint.test>"])
+			.set_profile(openpgp::Profile::RFC9580)
+			.expect("RFC9580 profile should be supported")
+			.set_cipher_suite(CipherSuite::Cv25519)
+			.generate()
+			.expect("v6 test certificate generation should succeed");
+		let public_key_armored = armor_cert(&cert).expect("v6 test certificate should armor");
+		let actual = openpgp_fingerprint_bytes_inner(&public_key_armored)
+			.expect("v6 test certificate should parse");
+
+		assert_eq!(actual.len(), 32);
+		assert_eq!(actual, cert.fingerprint().as_bytes());
+	}
+
+	#[test]
+	fn certificate_components_do_not_change_primary_key_fingerprint() {
+		let (cert, _) = CertBuilder::general_purpose(["Endpoint <endpoint.test>"])
+			.set_profile(openpgp::Profile::RFC4880)
+			.expect("RFC4880 profile should be supported")
+			.set_cipher_suite(CipherSuite::Cv25519)
+			.generate()
+			.expect("test certificate generation should succeed");
+		let original = cert.fingerprint().as_bytes().to_vec();
+		let tag = openpgp::packet::Tag::Private(61.into());
+		let unknown = openpgp::packet::Unknown::new(
+			tag,
+			openpgp::Error::UnsupportedPacketType(tag).into(),
+		);
+		let (modified, changed) = cert
+			.insert_packets(unknown)
+			.expect("unknown certificate component should be accepted");
+		assert!(changed);
+		let public_key_armored = armor_cert(&modified).expect("modified certificate should armor");
+
+		assert_eq!(openpgp_fingerprint_bytes_inner(&public_key_armored).unwrap(), original);
+	}
+}
+
 #[pymodule]
 fn endpoint_openpgp_sequoia(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 	module.add("OpenPgpError", py.get_type_bound::<OpenPgpError>())?;
@@ -308,7 +350,7 @@ fn endpoint_openpgp_sequoia(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyR
 	module.add("SignatureInvalid", py.get_type_bound::<SignatureInvalid>())?;
 	module.add("MalformedCiphertext", py.get_type_bound::<MalformedCiphertext>())?;
 	module.add_function(wrap_pyfunction!(generate_identity, module)?)?;
-	module.add_function(wrap_pyfunction!(canonical_public_key_bytes, module)?)?;
+	module.add_function(wrap_pyfunction!(openpgp_fingerprint_bytes, module)?)?;
 	module.add_function(wrap_pyfunction!(raw_openpgp_fingerprint, module)?)?;
 	module.add_function(wrap_pyfunction!(sign_detached, module)?)?;
 	module.add_function(wrap_pyfunction!(verify_detached, module)?)?;

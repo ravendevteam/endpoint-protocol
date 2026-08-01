@@ -23,7 +23,7 @@ MAX_JSON_DEPTH = 8
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 SAFE_FIELD_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 CONTENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
-FINGERPRINT_RE = re.compile(r"^ep1:[a-z2-7]{52}$")
+FINGERPRINT_RE = re.compile(r"^ep1:(?:[a-z2-7]{32}|[a-z2-7]{52})$")
 DELIVERY_ROLES = {"to", "cc", "bcc"}
 
 

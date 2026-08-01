@@ -99,7 +99,7 @@ def test_endpoint_error_safe_body_includes_hint_without_debug_detail() -> None:
 
 
 def test_contact_uri_parser_accepts_and_rejects_expected_shapes() -> None:
-	fingerprint = "ep1:" + ("a" * 52)
+	fingerprint = "ep1:" + ("a" * 32)
 	contact = {
 		"kind": "endpoint-contact",
 		"protocol_version": "endpoint-poc-1",
