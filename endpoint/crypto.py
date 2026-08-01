@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import uuid
 from pathlib import Path
 from typing import Any
 
 from .errors import EndpointError, require
+from .protocol import FINGERPRINT_RE
 
 PUBLIC_KEY_FILE = "public_key.asc"
 SECRET_KEY_FILE = "secret_key.asc"
@@ -116,9 +116,9 @@ class OpenPgpContext:
 
 
 
-def canonical_public_key_bytes(public_key_armored: str) -> bytes:
+def openpgp_fingerprint_bytes(public_key_armored: str) -> bytes:
 	try:
-		return bytes(_backend().canonical_public_key_bytes(public_key_armored))
+		return bytes(_backend().openpgp_fingerprint_bytes(public_key_armored))
 	except Exception as exc:
 		raise _map_backend_error(exc, "invalid_envelope", "public key is invalid") from exc
 
@@ -131,13 +131,14 @@ def raw_openpgp_fingerprint(public_key_armored: str) -> str:
 
 
 def endpoint_fingerprint(public_key_armored: str) -> str:
-	digest = hashlib.sha256(canonical_public_key_bytes(public_key_armored)).digest()
+	digest = openpgp_fingerprint_bytes(public_key_armored)
+	require(len(digest) in {20, 32}, "invalid_envelope", "OpenPGP fingerprint has an unsupported length")
 	encoded = base64.b32encode(digest).decode("ascii").rstrip("=").lower()
 	return f"ep1:{encoded}"
 
 
 def display_fingerprint(machine_fingerprint: str) -> str:
-	require(machine_fingerprint.startswith("ep1:"), "invalid_envelope", "invalid fingerprint")
+	require(isinstance(machine_fingerprint, str) and FINGERPRINT_RE.fullmatch(machine_fingerprint) is not None, "invalid_envelope", "invalid fingerprint")
 	raw = machine_fingerprint[4:].upper()
 	return "EP1 " + " ".join(raw[index:index + 4] for index in range(0, len(raw), 4))
 

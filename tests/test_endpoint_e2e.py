@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import socket
@@ -21,7 +22,7 @@ from websockets.asyncio.client import connect
 from endpoint.client_core import EndpointClient
 from endpoint.config import load_server_config
 from endpoint.credentials import generate_client_token, hash_client_token, validate_client_token_strength, verify_client_token
-from endpoint.crypto import OpenPgpContext, canonical_public_key_bytes, endpoint_fingerprint, verify_detached
+from endpoint.crypto import OpenPgpContext, endpoint_fingerprint, openpgp_fingerprint_bytes, raw_openpgp_fingerprint, verify_detached
 from endpoint.errors import EndpointError
 from endpoint.protocol import PROTOCOL_VERSION, canonical_json_bytes, parse_json_strict, validate_encrypted_envelope, validate_metadata
 from endpoint.server_core import ServerConfig, create_app
@@ -252,10 +253,13 @@ def test_sequoia_openpgp_backend_isolated_key_stores_and_error_mapping(tmp_path:
 	assert "BEGIN PGP PUBLIC KEY BLOCK" in alice_public
 	assert "BEGIN PGP PUBLIC KEY BLOCK" in bob_public
 	trace(f"Sequoia OpenPGP generated isolated Alice/Bob key stores: alice={alice.key_store_dir}, bob={bob.key_store_dir}")
-	alice_canonical = canonical_public_key_bytes(alice_public)
-	assert alice_canonical == canonical_public_key_bytes(alice_public)
-	assert endpoint_fingerprint(alice_public) == endpoint_fingerprint(alice_public)
-	trace("canonical public-key bytes and Endpoint fingerprints are stable for the same key")
+	alice_openpgp_fingerprint = bytes.fromhex(raw_openpgp_fingerprint(alice_public))
+	assert openpgp_fingerprint_bytes(alice_public) == alice_openpgp_fingerprint
+	assert endpoint_fingerprint(alice_public) == "ep1:" + base64.b32encode(alice_openpgp_fingerprint).decode("ascii").rstrip("=").lower()
+	assert len(endpoint_fingerprint(alice_public).removeprefix("ep1:")) == 32
+	assert endpoint_fingerprint(alice_public.replace("\n", "\r\n")) == endpoint_fingerprint(alice_public)
+	assert endpoint_fingerprint(alice_public) != endpoint_fingerprint(bob_public)
+	trace("Endpoint fingerprint is the native OpenPGP primary-key fingerprint encoded as unpadded Base32")
 	payload = b'{"message":"sequoia openpgp backend"}'
 	signature = alice.sign_detached(alice_fingerprint, payload)
 	assert "BEGIN PGP SIGNATURE" in signature
@@ -275,6 +279,17 @@ def test_sequoia_openpgp_backend_isolated_key_stores_and_error_mapping(tmp_path:
 	for marker in forbidden_runtime_markers:
 		assert marker not in crypto_source
 	trace("Sequoia OpenPGP encrypted/decrypted armored payloads and mapped malformed ciphertext safely")
+
+
+def test_old_certificate_hash_identity_is_rejected(tmp_path: Path) -> None:
+	url = f"https://127.0.0.1:{free_port()}"
+	client = make_client(tmp_path, "alice", url, "alice-token")
+	identity = client.export_identity({"username": "alice"})
+	identity["endpoint_fingerprint"] = "ep1:" + ("a" * 52)
+
+	with pytest.raises(EndpointError) as exc:
+		client.verify_identity(identity)
+	assert exc.value.code == "invalid_identity_signature"
 
 
 def test_server_json_config_loading_is_strict_and_hash_only(tmp_path: Path, trace: Any) -> None:
@@ -318,7 +333,7 @@ def test_server_json_config_loading_is_strict_and_hash_only(tmp_path: Path, trac
 		load_server_config(malformed_path)
 	assert malformed_exc.value.code == "invalid_config"
 	bad_identity = json.loads(json.dumps(document))
-	bad_identity["hosted_identities"]["alice"]["endpoint_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	bad_identity["hosted_identities"]["alice"]["endpoint_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	with pytest.raises(EndpointError):
 		create_app(load_server_config(write_config(tmp_path / "bad-identity.json", bad_identity)))
 	missing_hash = json.loads(json.dumps(document))
@@ -691,7 +706,7 @@ async def test_signature_wrong_recipient_and_duplicate_rejections(tmp_path: Path
 	trace("client rejected a payload whose body changed without a matching detached signature")
 	wrong_inner = parse_json_strict(client_b.openpgp.decrypt(good["ciphertext_armored"]))
 	wrong_inner["payload"]["message_id"] = "wrong-recipient-message"
-	wrong_inner["payload"]["recipient_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	wrong_inner["payload"]["recipient_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	wrong_inner["payload"]["recipient_route"] = good["recipient_route"]
 	wrong_inner["signature"] = client_a.openpgp.sign_detached(client_a.ensure_identity(), canonical_json_bytes(wrong_inner["payload"]))
 	wrong = dict(good)
@@ -945,7 +960,7 @@ def test_invalid_hosted_identity_config_is_rejected_at_startup(tmp_path: Path, t
 	identity = client.export_identity({"username": "alice"})
 	trace("testing server startup validation for configured public identities")
 	bad_fingerprint = dict(identity)
-	bad_fingerprint["endpoint_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	bad_fingerprint["endpoint_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	with pytest.raises(EndpointError):
 		create_app(make_server_config(tmp_path, "bad-start-fingerprint", url, bad_fingerprint, "alice-token", (port,), {url}))
 	trace("server startup rejected configured identity with mismatched fingerprint")
@@ -1308,7 +1323,7 @@ def test_inner_payload_mismatch_and_signature_metadata_matrix(tmp_path: Path, tr
 		assert exc.value.code == "outer_inner_mismatch"
 		trace(f"recipient rejected outer/inner mismatch for {field}")
 	inner = parse_json_strict(client_b.openpgp.decrypt(base["ciphertext_armored"]))
-	inner["sender_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	inner["sender_fingerprint"] = "ep1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	inner["payload"]["message_id"] = "matrix-inner-sender"
 	resign_inner(client_a, inner)
 	envelope = dict(base)
